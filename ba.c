@@ -220,7 +220,7 @@ done:
 
 struct bitxform {
 	enum op_t op; /* subset: AND, OR, XOR, NOT, SET, VAR */
-	unsigned a, b;
+	unsigned a, b; /* for op=VAR, variable=1: a = memory bit address (op->r+i) */ 
 	unsigned resolved : 1;
 	unsigned variable : 1;
 };
@@ -345,6 +345,15 @@ static struct clause * clause_create(unsigned n, ...)
 	return c;
 }
 
+static struct {
+	unsigned and;
+	unsigned or;
+	unsigned xor;
+	unsigned anti;
+	unsigned equi;
+	unsigned free;
+} stat = { 0, 0, 0, 0, 0, 0 };
+
 static void dimacs_cnf_eq(struct dimacs_cnf *cnf, int a, int b)
 {
 	dimacs_cnf_add(cnf, clause_create(2, a, -b));
@@ -391,12 +400,14 @@ static int bit_resolve(struct opxform *x, unsigned a, struct dimacs_cnf *cnf)
 		dimacs_cnf_add(cnf, clause_create(2,  ax->a,         -a));
 		dimacs_cnf_add(cnf, clause_create(2,          ax->b, -a));
 		dimacs_cnf_add(cnf, clause_create(3, -ax->a, -ax->b,  a));
+		stat.and++;
 		break;
 	case OR:
 		/* express a = ax->a+ax->b */
 		dimacs_cnf_add(cnf, clause_create(2, -ax->a,          a));
 		dimacs_cnf_add(cnf, clause_create(2,         -ax->b,  a));
 		dimacs_cnf_add(cnf, clause_create(3,  ax->a,  ax->b, -a));
+		stat.or++;
 		break;
 	case XOR:
 		/* express a = ax->a^ax->b */
@@ -404,20 +415,24 @@ static int bit_resolve(struct opxform *x, unsigned a, struct dimacs_cnf *cnf)
 		dimacs_cnf_add(cnf, clause_create(3, -ax->a, -ax->b, -a));
 		dimacs_cnf_add(cnf, clause_create(3,  ax->a,  ax->b, -a));
 		dimacs_cnf_add(cnf, clause_create(3,  ax->a, -ax->b,  a));
+		stat.xor++;
 		break;
 	case NOT:
 		/* express a = -ax->a */
 		dimacs_cnf_add(cnf, clause_create(2,  ax->a,  a));
 		dimacs_cnf_add(cnf, clause_create(2, -ax->a, -a));
-		// dimacs_cnf_eq(&cnf, a, -bit_resolve(x, ax->a));
+		// dimacs_cnf_eq(&cnf, a, -ax->a);
+		stat.anti++;
 		break;
 	case SET:
 		/* express a = ax->a */
 		dimacs_cnf_add(cnf, clause_create(2, -ax->a,  a));
 		dimacs_cnf_add(cnf, clause_create(2,  ax->a, -a));
-		// dimacs_cnf_eq(&cnf, a, bit_resolve(x, ax->a));
+		// dimacs_cnf_eq(&cnf, a, ax->a);
+		stat.equi++;
 		break;
 	case VAR:
+		stat.free++;
 		break;
 	default:;
 	}
@@ -589,8 +604,10 @@ static int opx_exec(struct opxform *x, const struct operation *op, struct dimacs
 			}
 		}
 		if (op->op == VAR)
-			for (i=0; i<n; i++)
+			for (i=0; i<n; i++) {
 				x->xf[k+i].variable = 1;
+				x->xf[k+i].a = op->r + i;
+			}
 		/* finally assign the output slots, s.t. an operation using
 		 * these op->r later references the correct values */
 		for (i=0; i<n; i++)
@@ -635,21 +652,19 @@ static void print_bits(const char *name, const struct bits *b)
 
 struct instance {
 	unsigned total_bits;
-	const struct operation *op;
 	struct opxform *x;
 	struct dimacs_cnf cnf;
 };
 
-#define INSTANCE_INIT	(struct instance){ 0, NULL, NULL, DIMACS_CNF_INIT }
+#define INSTANCE_INIT	(struct instance){ 0, NULL, DIMACS_CNF_INIT }
 
 static int instance_run(
 	struct instance *in, const struct operation *op
 ) {
-	in->op     = op;
 	in->x      = opx_init(in->total_bits);
 	memset(&in->cnf, 0, sizeof(in->cnf));
 
-	return opx_exec(in->x, in->op, &in->cnf);
+	return opx_exec(in->x, op, &in->cnf);
 }
 
 struct bits bits(struct instance *in, unsigned n)
@@ -658,44 +673,6 @@ struct bits bits(struct instance *in, unsigned n)
 	in->total_bits += n;
 	return r;
 }
-
-#if 0
-int main()
-{
-	struct instance in = INSTANCE_INIT;
-
-	unsigned z = 2;
-	struct bits I = bits(&in, z);
-	struct bits t = bits(&in, z);
-	struct bits O = bits(&in, z);
-
-	struct operation ops[] = {
-		OP_VAR(I),
-		OP_SET0(O),
-		OP_ROL(t,I,1),
-		OP_XOR(I,I,t),
-		OP_NOT(I,I),
-		OP_EXPECT(I,O),
-	};
-
-	int ret = instance_run(&in, &OP_CALL_ARR(ops));
-	if (!ret)
-		dimacs_cnf_print(stdout, &in.cnf);
-
-	return ret;
-}
-#elif 1
-static void * memdup(const void *src, size_t n)
-{
-	void *r = malloc(n);
-	if (!r) {
-		perror("malloc");
-		abort();
-	}
-	return memcpy(r, src, n);
-}
-
-#define memdup_arr(arr)	memdup((arr), sizeof(arr))
 
 struct keccak {
 	unsigned w, r, c, rounds;
@@ -888,59 +865,104 @@ static struct operation * keccak_input(
 	return f;
 }
 
+union bc {
+	unsigned char c[10];
+	bb_t b[2];
+};
+
+static const union bc out_r40[] = {
+	[ 1] = { { 0xe9, 0xf5, 0x7f, 0x02, 0xa9, 0xb0, 0xeb, 0xd8, 0x44, 0x98 } },
+	[ 2] = { { 0x02, 0x4a, 0x55, 0x18, 0xe1, 0xe9, 0x5d, 0xb5, 0x32, 0x19 } },
+	[ 3] = { { 0xd8, 0xed, 0x85, 0x69, 0x2a, 0xfb, 0xee, 0x4c, 0x99, 0xce } },
+	[ 4] = { { 0x74, 0x2c, 0x7e, 0x3c, 0xd9, 0x46, 0x1d, 0x0d, 0x03, 0x4e } },
+	[ 5] = { { 0xe0, 0x53, 0xf9, 0x64, 0x4f, 0xaa, 0xb1, 0xda, 0x31, 0x1b } },
+	[ 6] = { { 0xe5, 0x1c, 0x00, 0xc4, 0x8e, 0xd5, 0xdb, 0x07, 0x02, 0xb3 } },
+	[ 7] = { { 0x95, 0x93, 0x25, 0xc5, 0x67, 0x73, 0xa7, 0x4a, 0x43, 0xc6 } },
+	[ 8] = { { 0x05, 0x4d, 0xda, 0xf1, 0xb9, 0xb5, 0x9b, 0x9a, 0x60, 0xbf } },
+	[ 9] = { { 0x5e, 0xd1, 0xa9, 0xc1, 0x84, 0xeb, 0x72, 0xb9, 0x45, 0x46 } },
+	[10] = { { 0xc3, 0x8f, 0x61, 0x8f, 0x53, 0xa9, 0x6e, 0x4f, 0xfd, 0x53 } },
+	[11] = { { 0x19, 0xf8, 0xe6, 0xbc, 0x5d, 0x71, 0x41, 0x77, 0x65, 0x95 } },
+	[12] = { { 0x20, 0x68, 0x65, 0xeb, 0x08, 0xb4, 0x2a, 0x66, 0x63, 0xe1 } },
+};
+static const union bc out_r240[] = {
+	[ 1] = { { 0xd9, 0xd6, 0xd3, 0xc8, 0x4d, 0x1a, 0xc1, 0xd7, 0x5f, 0x96 } },
+	[ 2] = { { 0x7a, 0xb8, 0x98, 0x1a, 0xda, 0x8f, 0xdb, 0x60, 0xae, 0xfd } },
+	[ 3] = { { 0x5c, 0x9d, 0x5e, 0x4b, 0x38, 0x5e, 0x9c, 0x4f, 0x8e, 0x2e } },
+	[ 4] = { { 0x0d, 0xd2, 0x5e, 0x6d, 0xe2, 0x9a, 0x42, 0xad, 0xb3, 0x58 } },
+	[ 5] = { { 0x8d, 0xf4, 0x44, 0x09, 0xb4, 0x6f, 0xb8, 0xc6, 0x1b, 0xc4 } },
+	[ 6] = { { 0x57, 0x16, 0xe7, 0x01, 0xef, 0x67, 0xcc, 0x04, 0x48, 0xb0 } },
+	[ 7] = { { 0x9c, 0xec, 0xce, 0x92, 0x93, 0x8a, 0xea, 0xba, 0x26, 0xaf } },
+	[ 8] = { { 0x19, 0xc2, 0xd8, 0xff, 0x69, 0xe5, 0x66, 0xa5, 0x07, 0xc9 } },
+	[ 9] = { { 0x78, 0xd6, 0x58, 0xde, 0xc5, 0x01, 0xee, 0xd6, 0x3b, 0x1e } },
+	[10] = { { 0x46, 0x68, 0x1a, 0x4a, 0x3a, 0x97, 0x5b, 0x16, 0x2a, 0xc4 } },
+	[11] = { { 0x12, 0x9e, 0x94, 0x0f, 0x63, 0x43, 0x00, 0xf6, 0xb4, 0x14 } },
+	[12] = { { 0x85, 0x5a, 0x86, 0x45, 0x96, 0xc5, 0x1c, 0xaf, 0x7d, 0x3d } },
+};
+static const union bc out_r640[] = {
+	[ 1] = { { 0x3f, 0x41, 0x9f, 0x88, 0x1c, 0x42, 0xcf, 0xfc, 0x5f, 0xd7 } },
+	[ 2] = { { 0x82, 0x8d, 0x4d, 0x09, 0x05, 0x0e, 0x06, 0x35, 0x07, 0x5e } },
+	[ 3] = { { 0x00, 0x7b, 0xb5, 0xc5, 0x99, 0x80, 0x66, 0x0e, 0x02, 0x93 } },
+	[ 4] = { { 0x75, 0x1a, 0x16, 0xe5, 0xe4, 0x95, 0xe1, 0xe2, 0xff, 0x22 } },
+	[ 5] = { { 0x6e, 0xf2, 0x61, 0x6f, 0xeb, 0xb9, 0x9b, 0x1f, 0x70, 0xed } },
+	[ 6] = { { 0x5f, 0x9e, 0x63, 0x88, 0x4f, 0x2e, 0x94, 0xf1, 0xa1, 0x0e } },
+	[ 7] = { { 0xa4, 0xc1, 0x35, 0x21, 0x90, 0x12, 0xaa, 0xc8, 0x08, 0xed } },
+	[ 8] = { { 0xf4, 0x83, 0x5d, 0x80, 0x2a, 0xab, 0xc5, 0xbe, 0x75, 0x8e } },
+	[ 9] = { { 0x2e, 0xdd, 0x24, 0x58, 0x7f, 0x22, 0x5c, 0x69, 0x6e, 0x61 } },
+	[10] = { { 0xb8, 0x6d, 0xb6, 0x0f, 0xf7, 0x23, 0x18, 0x76, 0x6e, 0xef } },
+	[11] = { { 0xa2, 0x49, 0x0a, 0x3e, 0x68, 0xd5, 0xd0, 0x2d, 0xd4, 0xaa } },
+	[12] = { { 0x68, 0xed, 0xde, 0x13, 0xa4, 0x79, 0xe1, 0x47, 0x71, 0xbd } },
+};
+static const union bc out_r1440[] = {
+	[ 1] = { { 0x0f, 0x0a, 0xf7, 0x07, 0x4b, 0x6a, 0xbd, 0x48, 0x6f, 0x80 } },
+	[ 2] = { { 0x63, 0x90, 0x22, 0x0e, 0x7b, 0x5d, 0x32, 0x84, 0xd2, 0x3e } },
+	[ 3] = { { 0x06, 0x25, 0xa3, 0x46, 0x28, 0xc0, 0xcf, 0xe7, 0x6c, 0x75 } },
+	[ 4] = { { 0x7d, 0xaa, 0xd8, 0x07, 0xf8, 0x50, 0x6c, 0x9c, 0x02, 0x76 } },
+	[ 5] = { { 0x65, 0x3b, 0xc0, 0xf8, 0x7d, 0x26, 0x4f, 0x08, 0x57, 0xd0 } },
+	[ 6] = { { 0xd6, 0x05, 0x33, 0x5e, 0xdc, 0xe7, 0xd2, 0xca, 0xf4, 0x10 } },
+	[ 7] = { { 0x5e, 0x0d, 0x17, 0x9c, 0x50, 0xc2, 0x93, 0x0c, 0x0d, 0x76 } },
+	[ 8] = { { 0x34, 0xe1, 0x81, 0x23, 0x29, 0xd5, 0xe8, 0x9d, 0x67, 0x1a } },
+	[ 9] = { { 0xca, 0x18, 0x6a, 0x0f, 0xe1, 0x26, 0xed, 0xbe, 0x2c, 0xa6 } },
+	[10] = { { 0xdf, 0x7b, 0xf3, 0x01, 0x7c, 0xd3, 0x22, 0xa4, 0x6c, 0x31 } },
+	[11] = { { 0x69, 0xc9, 0x4f, 0x0a, 0xe8, 0x30, 0x40, 0x26, 0xb3, 0xda } },
+	[12] = { { 0xbf, 0x8c, 0x82, 0x63, 0xa9, 0x87, 0x59, 0x5b, 0x21, 0xc0 } },
+};
+
 int main(int argc, char **argv)
 {
 	struct instance in = INSTANCE_INIT;
 	struct keccak kc;
 	int ret;
 
-	if (argc < 4) {
-		fprintf(stderr, "usage: %s RATE CAP ROUNDS\n", argv[0]);
+	if (4 > argc || argc > 5) {
+		fprintf(stderr, "usage: %s RATE CAP ROUNDS [SOLUTION]\n", argv[0]);
 		return 1;
 	}
 
 	unsigned rate = atoi(argv[1]);   /* 40 */
 	unsigned cap = atoi(argv[2]);    /* 160 */
 	unsigned rounds = atoi(argv[3]); /* 1 */
+	FILE *sol = NULL;
+
+	if (argc > 4) {
+		sol = fopen(argv[4], "r");
+		if (!sol) {
+			perror(argv[4]);
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	struct operation *r;
 	struct operation *f;
 	struct operation *i;
 
-	union bc {
-		unsigned char c[16];
-		bb_t b[2];
-	};
-
-	static const union bc out_r40[] = {
-		[1] = { { 0xe9, 0xf5, 0x7f, 0x02, 0xa9, 0xb0, 0xeb, 0xd8, 0x44, 0x98 } },
-		[2] = { { 0x02, 0x4a, 0x55, 0x18, 0xe1, 0xe9, 0x5d, 0xb5, 0x32, 0x19 } },
-		[3] = { { 0xd8, 0xed, 0x85, 0x69, 0x2a, 0xfb, 0xee, 0x4c, 0x99, 0xce } },
-	};
-	static const union bc out_r240[] = {
-		[1] = { { 0xd9, 0xd6, 0xd3, 0xc8, 0x4d, 0x1a, 0xc1, 0xd7, 0x5f, 0x96 } },
-		[2] = { { 0x7a, 0xb8, 0x98, 0x1a, 0xda, 0x8f, 0xdb, 0x60, 0xae, 0xfd } },
-		[3] = { { 0x5c, 0x9d, 0x5e, 0x4b, 0x38, 0x5e, 0x9c, 0x4f, 0x8e, 0x2e } },
-	};
-	static const union bc out_r640[] = {
-		[1] = { { 0x3f, 0x41, 0x9f, 0x88, 0x1c, 0x42, 0xcf, 0xfc, 0x5f, 0xd7 } },
-		[2] = { { 0x82, 0x8d, 0x4d, 0x09, 0x05, 0x0e, 0x06, 0x35, 0x07, 0x5e } },
-		[3] = { { 0x00, 0x7b, 0xb5, 0xc5, 0x99, 0x80, 0x66, 0x0e, 0x02, 0x93 } },
-		[4] = { { 0x75, 0x1a, 0x16, 0xe5, 0xe4, 0x95, 0xe1, 0xe2, 0xff, 0x22 } },
-		[5] = { { 0x6e, 0xf2, 0x61, 0x6f, 0xeb, 0xb9, 0x9b, 0x1f, 0x70, 0xed } },
-	};
-	static const union bc out_r1440[] = {
-		[1] = { { 0x0f, 0x0a, 0xf7, 0x07, 0x4b, 0x6a, 0xbd, 0x48, 0x6f, 0x80 } },
-		[2] = { { 0x63, 0x90, 0x22, 0x0e, 0x7b, 0x5d, 0x32, 0x84, 0xd2, 0x3e } },
-		[3] = { { 0x06, 0x25, 0xa3, 0x46, 0x28, 0xc0, 0xcf, 0xe7, 0x6c, 0x75 } },
-	};
 	static const union bc *out_r;
 
+	assert(0 < rounds);
 	switch (rate) {
-	case   40: out_r = out_r40; assert(0 < rounds && rounds < ARRAY_SIZE(out_r40)); break;
-	case  240: out_r = out_r240; assert(0 < rounds && rounds < ARRAY_SIZE(out_r240)); break;
-	case  640: out_r = out_r640; assert(0 < rounds && rounds < ARRAY_SIZE(out_r640)); break;
-	case 1440: out_r = out_r1440; assert(0 < rounds && rounds < ARRAY_SIZE(out_r1440)); break;
+	case   40: out_r = out_r40; assert(rounds < ARRAY_SIZE(out_r40)); break;
+	case  240: out_r = out_r240; assert(rounds < ARRAY_SIZE(out_r240)); break;
+	case  640: out_r = out_r640; assert(rounds < ARRAY_SIZE(out_r640)); break;
+	case 1440: out_r = out_r1440; assert(rounds < ARRAY_SIZE(out_r1440)); break;
 	default: fprintf(stderr, "invalid rate: %u\n", rate); return EXIT_FAILURE;
 	}
 
@@ -950,16 +972,27 @@ int main(int argc, char **argv)
 	f = keccak_f(&kc, r);
 
 	struct bits S = kc.S;
-	struct bits I = bits(&in, 1 * kc.r - 16);
+	struct bits I = bits(&in, kc.r == 40 ? 2 * kc.r - 16 : kc.r - 16);
 	struct bits O = bits(&in, 80);
 
 	i = keccak_input(&kc, &in, I, f);
 
+	struct operation op_expect_40[] = {
+		{ EXPECT, 40, S.o, O.o },
+		*f,
+		{ EXPECT, 40, S.o, O.o + 40 },
+	};
+	struct operation op_expect_n[] = {
+		{ EXPECT, 80, S.o, O.o },
+	};
+
 	struct operation ops[] = {
 		OP_VAR(I),
 		OP_LOAD(O,0,out_r[kc.rounds].b),
+#if 0
+		OP_VAR(S),
+#else
 		OP_SET0(S),
-
 #if 0
 		{ XOR, kc.r, S.o, S.o, I.o },
 		*f,/*
@@ -968,214 +1001,56 @@ int main(int argc, char **argv)
 #else
 		*i,
 #endif
-
-#if 240
-		{ EXPECT, 80, S.o, O.o },
-#else
-		{ EXPECT,     kc.r, S.o, O.o },
-		*f,
-		{ EXPECT,     kc.r, S.o, O.o + kc.r },
 #endif
+		kc.r == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
 	};
 
 	ret = instance_run(&in, &OP_CALL_ARR(ops));
 	if (ret)
 		goto done;
 
-	dimacs_cnf_print(stdout, &in.cnf);
+	fprintf(stderr, "var summary: %u and, %u or, %u xor, %u anti, %u equi, %u free\n",
+		stat.and, stat.or, stat.xor, stat.anti, stat.equi, stat.free);
 
-done:
-	free(f);
-	free(r);
-	return ret;
-}
-#else
-int main(int argc, char **argv)
-{
-	unsigned k_r = 40;
-	unsigned z = 8; /* lane size, w */
-	unsigned rounds = 1;
+	/* mode of operation: CNF generation vs. solution compilation */
+	if (!sol) {
+		dimacs_cnf_print(stdout, &in.cnf);
+	} else {
+		/* assuming minisat, which unfortunately got an output format
+		 * that differs from DIMACS */
+		char buf[16];
+		signed var;
+		bb_t mem[(in.total_bits + bb_t_bits - 1) / bb_t_bits];
 
-	const struct bits A  = {           0, 5 * 5 * z }; /* I/O */
-	const struct bits B  = {  A.o +  A.n, 5 * 5 * z };
-	const struct bits C  = {  B.o +  B.n, 5 * z };
-	const struct bits D  = {  C.o +  C.n, 5 * z };
-	const struct bits r  = {  D.o +  D.n, z }; /* RC[round] */
-	const struct bits t  = {  r.o +  r.n, z };
-	const struct bits RC = {  t.o +  t.n, rounds * z }; /* constants */
-	const struct bits P  = { RC.o + RC.n, 2 * k_r }; /* I, mostly */
-	const struct bits O  = {  P.o +  P.n, 8 * 10 }; /* O */
-	unsigned total_bits = O.o + O.n;
-	const struct bits S  = A; /* state, in main loop */
+		fscanf(sol, "%s\n", buf);
+		if (strncmp("SAT", buf, 3)) {
+			fprintf(stderr, "supplied file does not contain a solution: %s\n", buf);
+			ret = EXIT_FAILURE;
+			goto done;
+		}
 
-	print_bits("A", &A);
-	print_bits("B", &B);
-	print_bits("C", &C);
-	print_bits("D", &D);
-	print_bits("r", &r);
-	print_bits("t", &t);
-	print_bits("RC", &RC);
-	print_bits("P", &P);
-	print_bits("O", &O);
+		memset(&mem, 0, sizeof(mem));
 
-	static const unsigned char out_r40[][10] = {
-		[1] = { 0xe9, 0xf5, 0x7f, 0x02, 0xa9, 0xb0, 0xeb, 0xd8, 0x44, 0x98 },
-		[2] = { 0x02, 0x4a, 0x55, 0x18, 0xe1, 0xe9, 0x5d, 0xb5, 0x32, 0x19 },
-	};
+		while (fscanf(sol, "%d", &var) == 1) {
+			unsigned idx = var < 0 ? -var : var;
+			struct bitxform *vx = in.x->xf + idx;
+			if (vx->variable)
+				bb_put(mem, var < 0 ? 0 : 1, vx->a, 1);
+		}
 
-	static const unsigned rotation_offsets[5][5] = {
-		{  0,  1, 62, 28, 27 },
-		{ 36, 44,  6, 55, 20 },
-		{  3, 10, 43, 25, 39 },
-		{ 41, 45, 15, 21,  8 },
-		{ 18,  2, 61, 56, 14 }
-	};
-
-	static const uint64_t keccak_rc[24] = {
-		[ 0] = 0x0000000000000001,
-		[ 1] = 0x0000000000008082,
-		[ 2] = 0x800000000000808A,
-		[ 3] = 0x8000000080008000,
-		[ 4] = 0x000000000000808B,
-		[ 5] = 0x0000000080000001,
-		[ 6] = 0x8000000080008081,
-		[ 7] = 0x8000000000008009,
-		[ 8] = 0x000000000000008A,
-		[ 9] = 0x0000000000000088,
-		[10] = 0x0000000080008009,
-		[11] = 0x000000008000000A,
-		[12] = 0x000000008000808B,
-		[13] = 0x800000000000008B,
-		[14] = 0x8000000000008089,
-		[15] = 0x8000000000008003,
-		[16] = 0x8000000000008002,
-		[17] = 0x8000000000000080,
-		[18] = 0x000000000000800A,
-		[19] = 0x800000008000000A,
-		[20] = 0x8000000080008081,
-		[21] = 0x8000000000008080,
-		[22] = 0x0000000080000001,
-		[23] = 0x8000000080008008,
-	};
-
-
-#define A(x,y)	(A.o + ((x) + (y)*5)*z)
-#define B(x,y)	(B.o + ((x) + (y)*5)*z)
-#define C(x)	(C.o + (x)*z)
-#define D(x)	(D.o + (x)*z)
-
-	const struct operation keccak_round[] = {
-		/* θ step */
-#define t0(x)	{ XOR, z, t.o, A(x,0), A(x,1) }, \
-		{ XOR, z, t.o, t.o, A(x,2) }, \
-		{ XOR, z, t.o, t.o, A(x,3) }, \
-		{ XOR, z, C(x), t.o, A(x,4) }
-		t0(0),
-		t0(1),
-		t0(2),
-		t0(3),
-		t0(4),
-
-#define t1(x)	{ ROL, z, t.o, C(((x)+1)%5), 1 }, \
-		{ XOR, z, D(x), C(((x)+5-1)%5), t.o }
-		t1(0),
-		t1(1),
-		t1(2),
-		t1(3),
-		t1(4),
-
-#define t2(x,y) { XOR, z, A(x,y), A(x,y), D(x) }
-		t2(0,0), t2(1,0), t2(2,0), t2(3,0), t2(4,0),
-		t2(0,1), t2(1,1), t2(2,1), t2(3,1), t2(4,1),
-		t2(0,2), t2(1,2), t2(2,2), t2(3,2), t2(4,2),
-		t2(0,3), t2(1,3), t2(2,3), t2(3,3), t2(4,3),
-		t2(0,4), t2(1,4), t2(2,4), t2(3,4), t2(4,4),
-
-		/* ρ and π steps */
-#define rp(x,y) { ROL, z, B(y,(2*x+3*y)%5), A(x,y), rotation_offsets[y][x] }
-		rp(0,0), rp(1,0), rp(2,0), rp(3,0), rp(4,0),
-		rp(0,1), rp(1,1), rp(2,1), rp(3,1), rp(4,1),
-		rp(0,2), rp(1,2), rp(2,2), rp(3,2), rp(4,2),
-		rp(0,3), rp(1,3), rp(2,3), rp(3,3), rp(4,3),
-		rp(0,4), rp(1,4), rp(2,4), rp(3,4), rp(4,4),
-
-		/* χ step */
-#define xi(x,y) { NOT, z, t.o, B(((x)+1)%5,y) }, \
-		{ AND, z, t.o, t.o, B(((x)+2)%5,y) }, \
-		{ XOR, z, A(x,y), B(x,y), t.o }
-		xi(0,0), xi(1,0), xi(2,0), xi(3,0), xi(4,0),
-		xi(0,1), xi(1,1), xi(2,1), xi(3,1), xi(4,1),
-		xi(0,2), xi(1,2), xi(2,2), xi(3,2), xi(4,2),
-		xi(0,3), xi(1,3), xi(2,3), xi(3,3), xi(4,3),
-		xi(0,4), xi(1,4), xi(2,4), xi(3,4), xi(4,4),
-
-		/* ι step */
-		{ XOR, z, A(0,0), A(0,0), r.o },
-	};
-	struct operation keccak_f[3*rounds];
-	unsigned i;
-	for (i=0; i<rounds; i++) {
-		struct operation loop[] = {
-			{ SET0, z, r.o, r.o },
-			{ XOR, z, r.o, r.o, RC.o + i * z },
-			{ CALL, ARRAY_SIZE(keccak_round), .tgt = keccak_round },
-		};
-		memcpy(keccak_f + 3*i, loop, sizeof(loop));
+		unsigned i;
+		printf("I %d bits, %d bytes: ", I.n, (I.n + 7) / 8);
+		for (i=I.o; i<I.o+I.n; i+=8)
+			printf("\\x%02lx", bb_get(mem, i, 8));
+		printf("\n");
 	}
 
-	unsigned nops = sizeof(keccak_round)/sizeof(*keccak_round);
-	fprintf(stderr, "%u, %u\n", nops, total_bits);
-
-	bb_t *bb = calloc((total_bits + bb_t_bits - 1) / bb_t_bits, sizeof(bb_t));
-
-	bits_set(bb, 0, &A);
-	bits_set(bb, 0, &B);
-	bits_set(bb, 0, &C);
-	bits_set(bb, 0, &D);
-	bits_set(bb, 0, &t);
-
-	for (i=0; i<rounds; i++)
-		bb_put(bb, keccak_rc[i], RC.o + z * i, z);
-
-	const unsigned char (*out)[10] = out_r40 + rounds;
-	for (i=0; i<ARRAY_SIZE(*out); i++)
-		bb_put(bb, (*out)[i], O.o + i * 8, 8);
-
-	const struct operation keccak_test[] = {
-		{ VAR, P.n, P.o },
-		{ SET0, S.n, S.o },
-		{ LOAD, RC.n, RC.o, RC.o, .v = bb },
-		{ LOAD,  O.n,  O.o,  O.o, .v = bb },
-
-		{ XOR, k_r, S.o, P.o + 0 * k_r },
-		{ CALL, ARRAY_SIZE(keccak_f), .tgt = keccak_f },
-		{ XOR, k_r, S.o, P.o + 1 * k_r },
-		{ CALL, ARRAY_SIZE(keccak_f), .tgt = keccak_f },
-
-		{ EXPECT, k_r, S.o, O.o + 0 * k_r },
-		{ CALL, ARRAY_SIZE(keccak_f), .tgt = keccak_f },
-		{ EXPECT, k_r, S.o, O.o + 1 * k_r },
-	};
-
-	struct operation run = {
-		CALL,
-		ARRAY_SIZE(keccak_test),
-		.tgt = keccak_test
-	};
-
-	int ret;
-#if 1
-	struct opxform *x = opx_init(total_bits);
-	struct dimacs_cnf cnf = { 0, 0, NULL, 0 };
-	ret = opx_exec(x, &run, &cnf);
-#else
-	ret = exec(bb, &run);
-#endif
-
-	cnf.v = x->xf_n;
-
-	dimacs_cnf_print(stdout, &cnf);
+done:
+	free(i);
+	free(f);
+	free(r);
+	if (sol)
+		fclose(sol);
 
 	return ret;
 }
-#endif
