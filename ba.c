@@ -5,8 +5,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <assert.h>
-
-#define ARRAY_SIZE(arr)		(sizeof(arr)/sizeof(*(arr)))
+#include <stddef.h>
 
 // typedef unsigned long bit_t;
 
@@ -50,11 +49,11 @@ static struct op_flags {
 	unsigned mem_a : 1;
 	unsigned mem_b : 1;
 } const op_flags[] = {
-	[AND ]       = { 1, 1, 1 },
-	[OR  ]       = { 1, 1, 1 },
-	[XOR ]       = { 1, 1, 1 },
-	[NOT ]       = { 1, 1, 0 },
-	[ROL ]       = { 1, 1, 0 }, /* b valid but rot amount, no mem ptr */
+	[AND]        = { 1, 1, 1 },
+	[OR]         = { 1, 1, 1 },
+	[XOR]        = { 1, 1, 1 },
+	[NOT]        = { 1, 1, 0 },
+	[ROL]        = { 1, 1, 0 }, /* b valid but rot amount, no mem ptr */
 	[CALL]       = { 0, 0, 0 },
 	[EXPECT]     = { 0, 1, 1 },
 	[EXPECT_ANY] = { 0, 1, 0 },
@@ -241,12 +240,60 @@ done:
 }
 #endif
 
+#define PRI_BUFSZ	256
+
+static const char * opstr(const struct operation *op)
+{
+	static char buf[PRI_BUFSZ];
+
+	snprintf(buf, sizeof(buf), "%s[n:%u,r:%u,a:%u,b:%u]",
+		op_names[op->op], op->n, op->r, op->a, op->b);
+
+	return buf;
+}
+
+#include "common.h"
+
+enum lop_t {
+	L_AND, /* binary */
+	L_OR, /* n-ary */
+	L_XOR, /* binary */
+	L_NOT, /* unary */
+	L_EQ, /* n-ary (if none fixed, otherwise collapsed) */
+	L_VAR, /* leaf */
+};
+
 struct bitxform {
 	enum op_t op; /* subset: AND, OR, XOR, NOT, SET, VAR */
 	unsigned a, b; /* for op=VAR, variable=1: a = memory bit address (op->r+i) */ 
 	unsigned resolved : 1;
 	unsigned variable : 1;
+	unsigned referees_n;
+	unsigned referees_sz;
+	unsigned *referees;
+	signed folded_value;
 };
+
+static void bit_referee_add(struct bitxform *bx, unsigned referee)
+{
+#if 1
+	// darray_ensure(&bx->referees, &bx->referees_sz, sizeof(*bx->referees), bx->referees_n + 1);
+	darr_ensure(bx->referees, bx->referees_sz, bx->referees_n + 1);
+#else
+	if (bx->referees_n + 1 >= bx->referees_sz) {
+		unsigned nsz = 2 * (bx->referees_n + 1);
+		bx->referees = realloc(bx->referees, sizeof(signed) * nsz);
+		if (!bx->referees) {
+			perror("realloc");
+			exit(EXIT_FAILURE);
+		}
+		memset(bx->referees + bx->referees_sz, 0,
+			sizeof(signed) * (nsz - bx->referees_sz));
+		bx->referees_sz = nsz;
+	}
+#endif
+	bx->referees[bx->referees_n++] = referee;
+}
 
 #define OPX_NIL		0
 #define OPX_FALSE	1
@@ -260,8 +307,6 @@ struct opxform {
 	unsigned mem2xf[]; /* size: total_bits */
 };
 
-#include <stddef.h>
-
 struct opxform * opx_init(unsigned total_bits)
 {
 	struct opxform *r = calloc(offsetof(struct opxform, mem2xf)
@@ -274,6 +319,9 @@ struct opxform * opx_init(unsigned total_bits)
 static unsigned opx_alloc(struct opxform *x, unsigned n)
 {
 	unsigned r = x->xf_n;
+#if 1
+	darr_ensure(x->xf, x->xf_sz, r + n);
+#else
 	if (x->xf_sz < x->xf_n + n) {
 		unsigned nsz = 2 * (x->xf_n + n);
 		if (!(x->xf = realloc(x->xf, nsz * sizeof(struct bitxform)))) {
@@ -284,94 +332,10 @@ static unsigned opx_alloc(struct opxform *x, unsigned n)
 			(nsz - x->xf_sz) * sizeof(struct bitxform));
 		x->xf_sz = nsz;
 	}
+#endif
 	x->xf_n += n;
 	return r;
 }
-
-#define PRI_BUFSZ	256
-
-static const char * opstr(const struct operation *op)
-{
-	static char buf[PRI_BUFSZ];
-
-	snprintf(buf, sizeof(buf), "%s[n:%u,r:%u,a:%u,b:%u]",
-		op_names[op->op], op->n, op->r, op->a, op->b);
-
-	return buf;
-}
-
-struct clause {
-	unsigned n;
-	signed l[];
-};
-
-#define DIMACS_CNF_INIT	(struct dimacs_cnf){ 0, 0, NULL, 0 }
-struct dimacs_cnf {
-	unsigned v, c;
-	struct clause **cl;
-	unsigned cl_sz;
-};
-
-static void dimacs_cnf_print(FILE *f, const struct dimacs_cnf *cnf)
-{
-	unsigned i, j;
-	struct clause *c;
-
-	fprintf(f, "p cnf %u %u\n", cnf->v, cnf->c);
-	for (i=0; i<cnf->c; i++) {
-		c = cnf->cl[i];
-		for (j=0; j<c->n; j++)
-			fprintf(f, "%d ", c->l[j]);
-		fprintf(f, "0\n");
-	}
-}
-
-static void dimacs_cnf_add(struct dimacs_cnf *cnf, struct clause *c)
-{
-	unsigned n = cnf->c;
-	unsigned i;
-
-	if (cnf->cl_sz < n + 1) {
-		unsigned nsz = 2 * (n + 1);
-		if (!(cnf->cl = realloc(cnf->cl, sizeof(struct clause *) * nsz))) {
-			perror("realloc");
-			exit(EXIT_FAILURE);
-		}
-		memset(cnf->cl + cnf->cl_sz, 0,
-			(nsz - n) * sizeof(struct clause *));
-		cnf->cl_sz = nsz;
-	}
-	cnf->cl[cnf->c++] = c;
-
-	for (i=0; i<c->n; i++) {
-		int l = c->l[i];
-		if (l < 0)
-			l = -l;
-		if (cnf->v < l)
-			cnf->v = l;
-	}
-}
-
-static struct clause * clause_create(unsigned n, ...)
-{
-	struct clause *c = malloc(offsetof(struct clause,l) + sizeof(signed)*n);
-	va_list ap;
-	unsigned i;
-
-	c->n = n;
-
-	va_start(ap, n);
-	for (i=0; i<n; i++)
-		c->l[i] = va_arg(ap, signed);
-	va_end(ap);
-
-	return c;
-}
-
-#define dimacs_cnf_addn(cnf, ...)                         \
-	dimacs_cnf_add(cnf, clause_create(                \
-		ARRAY_SIZE(((signed []){ __VA_ARGS__ })), \
-		__VA_ARGS__))
 
 static struct {
 	unsigned and;
@@ -382,41 +346,213 @@ static struct {
 	unsigned free;
 } stat = { 0, 0, 0, 0, 0, 0 };
 
-static void dimacs_cnf_eq(struct dimacs_cnf *cnf, int a, int b)
+/* TODO: equivalence class transformations (0,1: bitxform.constant = 1, OPX_*)
+ * (NOT NOT) = id                     [done]
+ * (SET a) = a                        [done]
+ * (NOT a) = -a                       [done]
+ * (XOR a a) = 0                      [done]
+ * (XOR a -a) = 1                     [done]
+ * (XOR 0 a) = a                      [done]
+ * (XOR 1 a) = -a                     [done]
+ * // (NOT XOR a b) = (EXPECT a b)
+ * (AND a  a) = a                     [done]
+ * (AND a -a) = 0                     [done]
+ * (AND 0  a) = 0                     [done]
+ * (AND 1  a) = a                     [done]
+ * (OR a  a) = a                      [done]
+ * (OR a -a) = 1                      [done]
+ * (OR 0  a) = a                      [done]
+ * (OR 1  a) = 1                      [done]
+ *
+ * (OR AND a NOT b AND NOT a b) = (XOR a b)
+ * (AND OR NOT a b OR a NOT b) = (NOT XOR a b)
+ * // (OR NOT a NOT b) = (NOT AND a b)
+ * // (AND NOT a NOT b) = (NOT OR a b)
+ * (EXPECT_ANY OR a b) = (EXPECT_ANY (ab))
+ * (EXPECT SET a b c) = (AND OR -a c OR b -c OR a -b)
+ * 
+ * (SET SET a b c) = (AND OR -a c OR b -c OR a -b)
+ * 
+ * 1. SSA form
+ * 2. do
+ *    - run above reductions / constant/variable propagations
+ *    - common subexpression elimination
+ *    while (changes)
+ * 3. transform EXPECT*'s
+ */
+
+static signed bit_fold(const struct opxform *x, unsigned a);
+
+static signed _bit_fold(const struct opxform *x, unsigned a)
 {
-	dimacs_cnf_addn(cnf,  a, -b);
-	dimacs_cnf_addn(cnf, -a,  b);
+	const struct bitxform *ax = x->xf + a;
+	signed s, t;
+	unsigned as, at;
+
+	if (a < OPX_RESERVED)
+		return a;
+
+	switch (ax->op) {
+	case AND:
+	case OR:
+	case XOR:
+		break;
+	case NOT:
+#if 0
+		return -bit_fold(x, ax->a);
+#else
+		s = bit_fold(x, ax->a);
+		as = s < 0 ? -s : s;
+		switch (as) {
+		case OPX_FALSE:
+		case OPX_TRUE:
+			return -s;
+		}
+		return a;
+#endif
+	case SET:
+		return bit_fold(x, ax->a);
+	case VAR:
+		return a;
+	default:
+		goto fail;
+	}
+
+	s = bit_fold(x, ax->a);
+	t = bit_fold(x, ax->b);
+
+	if (s == t) {
+		switch (ax->op) {
+		case AND: /* a AND a */
+		case OR:  /* a OR  a */
+			return s;
+		case XOR: /* a XOR a */
+			return OPX_FALSE;
+		default:
+			goto fail;
+		}
+	} else if (s == -t) {
+		switch (ax->op) {
+		case AND: /* a AND -a */
+			return OPX_FALSE;
+		case OR:  /* a OR  -a */
+		case XOR: /* a XOR -a */
+			return OPX_TRUE;
+		default:
+			goto fail;
+		}
+	}
+
+	as = s < 0 ? -s : s;
+	at = t < 0 ? -t : t;
+
+	if (at < OPX_RESERVED) {
+		/* AND, OR, XOR are commutative */
+		signed tmp = t;
+		unsigned atmp = at;
+		t = s;
+		at = as;
+		s = tmp;
+		as = atmp;
+	}
+
+	switch (as) {
+	case OPX_NIL:
+		fprintf(stderr, "invalid bit-folded value: OPX_NIL for bit a = %u\n", a);
+		abort();
+	/* further folding possible for (at least) one constant */
+	/* -OPX_FALSE = OPX_TRUE, -OPX_TRUE = OPX_FALSE */
+	case OPX_FALSE:
+		if (s < 0)
+			as = OPX_TRUE;
+		break;
+	case OPX_TRUE:
+		if (s < 0)
+			as = OPX_FALSE;
+		break;
+	default:
+		/* both unequal and non-const, can't fold here */
+		return a;
+	}
+
+	switch (ax->op) {
+	case AND:
+		return as == OPX_FALSE ? OPX_FALSE : t;
+	case OR:
+		return as == OPX_FALSE ? t : OPX_TRUE;
+	case XOR:
+		return as == OPX_FALSE ? t : -t;
+	default:
+		goto fail;
+	}
+fail:
+	abort();
 }
 
+static signed bit_fold(const struct opxform *x, unsigned a)
+{
+	struct bitxform *ax = x->xf + a;
+
+	if (0)
+		return a;
+
+	if (!ax->folded_value)
+		ax->folded_value = _bit_fold(x, a);
+	return ax->folded_value;
+}
+
+static struct op_stat {
+	unsigned a[12], b[12];
+} par_stat[12];
+
 // /* returns a dimacs_cnf literal corresponding to x->xf[a] */
-static int bit_resolve(struct opxform *x, unsigned a, struct dimacs_cnf *cnf)
+static int bit_resolve(const struct opxform *x, unsigned a, const struct out *o)
 {
 	struct bitxform *ax = x->xf + a;
 	enum op_t op = ax->op;
+	signed ta, tb;
+	unsigned ata, atb;
+	int r = 0;
 
 	/* if ax is 'already resolved', return */
 	if (ax->resolved)
-		return 0;
+		return r;
 
 	if (a == OPX_FALSE) {
-		dimacs_cnf_addn(cnf, -a);
+		// dimacs_cnf_addn(cnf, -a);
+		o->constr_out(o->p, 1, (signed[]){ -a });
 		goto done;
 	}
 	if (a == OPX_TRUE) {
-		dimacs_cnf_addn(cnf,  a);
+		// dimacs_cnf_addn(cnf,  a);
+		o->constr_out(o->p, 1, (signed[]){  a });
 		goto done;
 	}
 
 	assert(a >= OPX_RESERVED);
 
+	ta = ax->a;
+	tb = ax->b;
+#if 1
+	/* TODO: bit_fold shall only proceed further down while refcnt == 1 */
+	if (op_flags[op].mem_a)
+		ta = bit_fold(x, ta);
+	if (op_flags[op].mem_b)
+		tb = bit_fold(x, tb);
+#endif
+	ata = ta < 0 ? -ta : ta;
+	atb = tb < 0 ? -tb : tb;
+
 	switch (op) {
 	case AND:
 	case OR:
 	case XOR:
-		bit_resolve(x, ax->b, cnf);
+		bit_resolve(x, atb, o);
+		par_stat[op].b[x->xf[atb].op]++;
 	case NOT:
 	case SET:
-		bit_resolve(x, ax->a, cnf);
+		bit_resolve(x, ata, o);
+		par_stat[op].a[x->xf[ata].op]++;
 	case VAR:
 		break;
 	default:
@@ -426,39 +562,18 @@ static int bit_resolve(struct opxform *x, unsigned a, struct dimacs_cnf *cnf)
 
 	switch (op) {
 	case AND:
-		/* express a = ax->a*ax->b */
-		dimacs_cnf_addn(cnf,  ax->a,         -a);
-		dimacs_cnf_addn(cnf,          ax->b, -a);
-		dimacs_cnf_addn(cnf, -ax->a, -ax->b,  a);
 		stat.and++;
 		break;
 	case OR:
-		/* express a = ax->a+ax->b */
-		dimacs_cnf_addn(cnf, -ax->a,          a);
-		dimacs_cnf_addn(cnf,         -ax->b,  a);
-		dimacs_cnf_addn(cnf,  ax->a,  ax->b, -a);
 		stat.or++;
 		break;
 	case XOR:
-		/* express a = ax->a^ax->b */
-		dimacs_cnf_addn(cnf, -ax->a,  ax->b,  a);
-		dimacs_cnf_addn(cnf, -ax->a, -ax->b, -a);
-		dimacs_cnf_addn(cnf,  ax->a,  ax->b, -a);
-		dimacs_cnf_addn(cnf,  ax->a, -ax->b,  a);
 		stat.xor++;
 		break;
 	case NOT:
-		/* express a = -ax->a */
-		dimacs_cnf_addn(cnf,  ax->a,  a);
-		dimacs_cnf_addn(cnf, -ax->a, -a);
-		// dimacs_cnf_eq(&cnf, a, -ax->a);
 		stat.anti++;
 		break;
 	case SET:
-		/* express a = ax->a */
-		dimacs_cnf_addn(cnf, -ax->a,  a);
-		dimacs_cnf_addn(cnf,  ax->a, -a);
-		// dimacs_cnf_eq(&cnf, a, ax->a);
 		stat.equi++;
 		break;
 	case VAR:
@@ -467,64 +582,92 @@ static int bit_resolve(struct opxform *x, unsigned a, struct dimacs_cnf *cnf)
 	default:;
 	}
 
+	r = o->bit_out(o->p, op, a, ta, tb);
+
 done:
 	/* mark ax as 'already resolved' */
 	ax->resolved = 1;
 
-	return 0;
+	return r;
 }
 
 #if 0
-/* a,b: indices into xf */
-static int bit_expect(const struct opxform *x, unsigned a, unsigned b)
+/* SET, EXPECT -> EQ */
+/* EXPECT_ANY  -> EQ OR TRUE */
+
+struct lnode {
+	enum lop_t op;
+	/* indices into lgraph's nodes array */
+	/* successors */
+	union {
+		struct { unsigned a, b; };         /* L_AND, L_XOR, L_NOT */
+		struct { unsigned n, sz, *ops; };  /* L_OR, L_EQ */
+	};
+	unsigned *referees; /* ordered predecessor list (not a set) */
+	unsigned referees_n, referees_sz;
+	unsigned var_id;
+};
+
+struct lnode root = { L_AND, { { 3, 4 } }, NULL, 0, 0, 0 };
+
+/* top -> down */
+static void simplify_fact(struct lnode *n, signed v) /* v: +/- OPX_TRUE */
 {
-	struct bitxform *ax = x->xf + a;
-	enum op_t op = ax->op;
-
-	if (a < OPX_RESERVED) {
-		fprintf(stderr, "bit_expect: a (%u) is reserved\n", a);
-		return 1;
-	}
-	if (b >= OPX_RESERVED) {
-		fprintf(stderr, "bit_expect: b (%u) is not reserved\n", b);
-		return 1;
-	}
-
-	switch (op) {
-	case AND:
-	case OR:
-		if (b) {
-			dimacs_cnf_add(&cnf, clause_create(2, ax->a, ax->b));
-		} else {
-			dimacs_cnf_add(&cnf, clause_create(1, -ax->a));
-			dimacs_cnf_add(&cnf, clause_create(1, -ax->b));
-		}
-		return 0;
-	case XOR:
-		dimacs_cnf_eq(&cnf, b ? -ax->a : ax->a, ax->b);
-		return 0;
-	case NOT:
-		dimacs_cnf_eq(&cnf, a, -ax->a);
-		return bit_expect(x, ax->a, !b);
-	case SET:
-		dimacs_cnf_eq(&cnf, a, ax->a);
-		return bit_expect(x, ax->a, b);
-	case VAR:
-		dimacs_cnf_add(&cnf, clause_create(1, b ? a : -a));
-		return 0;
-	case ROL:
-	case CALL:
-	case EXPECT:
-	case SET0:
-	case LOAD:
-		fprintf(stderr, "invalid bit_expect: %s\n", op_names[op]);
+	switch (n->op) {
+	case L_AND:
+	case L_OR:
+	case L_XOR:
+	case L_NOT:
+	case L_EQ:
+	case L_VAR:
+		forall p : referees
+			simplify_fact(reference[p,this], v);
+		this->value = v;
 		break;
 	}
-	return 1;
 }
+
+static void merge(struct lnode *tgt, struct lnode *src)
+{
+	forall p : src->referees {
+		delete reference[p,src]
+		add    reference[p,tgt]
+	}
+	forall c : src->operands {
+		delete reference[src,c]
+		add    reference[tgt,c]
+	}
+}
+
+static void simplify_merge(struct lnode *n)
+{
+	switch (n->op) {
+	case L_AND:
+	case L_OR:
+	case L_XOR:
+	case L_EQ:
+		/* associativity */
+		forall c : operands
+			if (c->op == n->op && c->refcnt == 1)
+				merge(n, c)
+		break;
+	case L_NOT:
+	case L_VAR:
+	}
+}
+
+struct exec_plan {
+	unsigned (*exp)[2];
+	unsigned exp_n, exp_sz;
+	struct exp_any {
+		unsigned n;
+		unsigned *v;
+	} *exp_any;
+	unsigned exp_any_n, exp_any_sz;
+};
 #endif
 
-static int opx_exec(struct opxform *x, const struct operation *op, struct dimacs_cnf *cnf)
+static int opx_exec(struct opxform *x, const struct operation *op, const struct out *o)
 {
 	unsigned i, k, n, b;
 	int r = 0;
@@ -594,51 +737,70 @@ static int opx_exec(struct opxform *x, const struct operation *op, struct dimacs
 		break;
 	case CALL:
 		for (i=0; i<n; i++)
-			if ((r = opx_exec(x, op->tgt + i, cnf)) != 0) {
+			if ((r = opx_exec(x, op->tgt + i, o)) != 0) {
 				fprintf(stderr, "call stack %u: op %p: %s\n",
 					i, (void *)op, opstr(op));
 				break;
 			}
 		break;
 	case EXPECT:
-#if 1
 		fprintf(stderr, "expect, current ssa vars: %u, op: %s\n",
 			x->xf_n, opstr(op));
+#if 0
+		struct exec_plan *ep;
+		darr_ensure(ep->exp, ep->exp_sz, ep->exp_n + n);
 		for (i=0; i<n; i++) {
 			unsigned v = x->mem2xf[op->a + i];
 			unsigned e = x->mem2xf[op->b + i];
-			if ((r = bit_resolve(x, v, cnf)) != 0) {
-				fprintf(stderr, "ERROR: offending operation: %s\n", opstr(op));
-				break;
-			}
-			if ((r = bit_resolve(x, e, cnf)) != 0) {
-				fprintf(stderr, "ERROR: offending operation: %s\n", opstr(op));
-				break;
-			}
-			dimacs_cnf_eq(cnf, v, e);
+			bit_traverse(x, v);
+			bit_traverse(x, e);
+			ep->exp[ep->exp_n + i][0] = v;
+			ep->exp[ep->exp_n + i][1] = e;
 		}
-		break;
 #else
-		r = opx_expect(x, op, cnf);
-		if (r)
-			fprintf(stderr, "ERROR: offending operation: %s\n", opstr(op));
-		break;
+		for (i=0; i<n; i++) {
+			unsigned v = x->mem2xf[op->a + i];
+			unsigned e = x->mem2xf[op->b + i];
+			if ((r = bit_resolve(x, v, o)) != 0) {
+				fprintf(stderr, "ERROR: offending operation: %s\n", opstr(op));
+				break;
+			}
+			if ((r = bit_resolve(x, e, o)) != 0) {
+				fprintf(stderr, "ERROR: offending operation: %s\n", opstr(op));
+				break;
+			}
+			// dimacs_cnf_eq(cnf, v, e);
+			o->constr_out(o->p, 2, (signed[]){  v, -e });
+			o->constr_out(o->p, 2, (signed[]){ -v,  e });
+		}
 #endif
+		break;
 	case EXPECT_ANY:
 		fprintf(stderr, "expect_any, current ssa vars: %u, op: %s\n",
 			x->xf_n, opstr(op));
+		/* TODO! */
 		c = malloc(offsetof(struct clause,l) + sizeof(signed)*n);
 		c->n = n;
 		for (i=0; i<n; i++) {
 			unsigned v = x->mem2xf[op->a + i];
-			bit_resolve(x, v, cnf);
+			bit_resolve(x, v, o);
 			c->l[i] = v;
 		}
-		dimacs_cnf_add(cnf, c);
+		// dimacs_cnf_add(o->p, c);
+		o->constr_out(o->p, n, c->l);
+		free(c);
 		break;
 	}
 
 	if (of.mem_r) {
+#if 0
+		for (i=0; i<n; i++) {
+			if (op_flags[x->xf[k+i].op].mem_a)
+				bit_referee_add(&x->xf[x->xf[k+i].a], k+i);
+			if (op_flags[x->xf[k+i].op].mem_b)
+				bit_referee_add(&x->xf[x->xf[k+i].b], k+i);
+		}
+#endif
 		/* finally assign the output slots, s.t. an operation using
 		 * these op->r later references the correct values */
 		for (i=0; i<n; i++)
@@ -660,15 +822,54 @@ struct instance {
 	struct dimacs_cnf cnf;
 };
 
+static int dot_bit_out(void *p, enum op_t op, unsigned a, signed ta, signed tb)
+{
+	switch (op) {
+	case AND:
+	case OR:
+	case XOR:
+		fprintf(p, "\t%u -> %d\n", a, tb);
+	case NOT:
+	case SET:
+		fprintf(p, "\t%u -> %d\n", a, ta);
+		fprintf(p, "\t%u [label=\"%u %s\"]\n", a, a, op_names[op]);
+		break;
+	case VAR:
+		fprintf(p, "\t%u [style=filled,color=green]\n", a);
+		break;
+	default:
+		return 1;
+	}
+	return 0;
+}
+
+static int dot_constr_out(void *p, unsigned n, const signed *l)
+{
+	static int or_n = 0;
+	if (n == 2) {
+		fprintf(p, "\t%d [style=filled,color=red]\n", l[0]);
+		fprintf(p, "\t%d [style=filled,color=red]\n", l[1]);
+		fprintf(p, "\t%d -> %d [dir=both,label=\"=\",color=purple]\n", l[0], l[1]);
+	} else {
+		fprintf(p, "\tor%u [label=\"or\",color=purple,shape=box]\n", ++or_n);
+		while (n--) {
+			signed v = *l++;
+			fprintf(p, "%d [style=filled,color=red]\n", v);
+			fprintf(p, "\tor%u -> %d [color=purple]\n", or_n, v);
+		}
+	}
+	return 0;
+}
+
 #define INSTANCE_INIT	(struct instance){ 0, NULL, DIMACS_CNF_INIT }
 
 static int instance_run(
-	struct instance *in, const struct operation *op
+	struct instance *in, const struct operation *op, const struct out *o
 ) {
 	in->x      = opx_init(in->total_bits);
-	memset(&in->cnf, 0, sizeof(in->cnf));
 
-	return opx_exec(in->x, op, &in->cnf);
+	int r = opx_exec(in->x, op, o); /* TODO: param: _const_ struct out *o */
+	return r;
 }
 
 struct bits bits(struct instance *in, unsigned n)
@@ -976,7 +1177,7 @@ static const union bc out_r1440[] = {
 
 static unsigned rate, cap, rounds;
 
-static int keccak_preimage(struct instance *in, struct bits I, struct bits O)
+static int keccak_preimage(struct instance *in, struct bits I, struct bits O, const struct out *o)
 {
 	struct keccak kc;
 	const union bc *out_r;
@@ -1023,20 +1224,21 @@ static int keccak_preimage(struct instance *in, struct bits I, struct bits O)
 		*kc.absorb,
 #endif
 #endif
-		// kc.r == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
-		*kc.squeeze,
+		kc.r == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
+		// *kc.squeeze,
 
-		OP_EXPECT(P,O), /* worse than w/o squeeze */
+		// OP_EXPECT(P,O), /* worse than w/o squeeze */
 	};
 
-	return instance_run(in, &OP_CALL_ARR(ops));
+	return instance_run(in, &OP_CALL_ARR(ops), o);
 
 	// keccak_free(&kc)
 }
 
 static int keccak_collision(
 	struct instance *in,
-	struct bits I, struct bits J, struct bits O, struct bits P
+	struct bits I, struct bits J, struct bits O, struct bits P,
+	const struct out *o
 ) {
 	struct keccak kc0, kc1;
 
@@ -1057,11 +1259,11 @@ static int keccak_collision(
 		// *kc1.squeeze,
 
 		/* TODO: only for >= 240 */
-		{ EXPECT, 160, 0, kc0.S.o, kc1.S.o },
+		{ EXPECT, kc0.S.n/*160*/, 0, kc0.S.o, kc1.S.o },
 		// OP_EXPECT(O,P), /* time worse for c 640 160 2 than w/o squeeze */
 	};
 
-	if (I.n == J.n) {
+	if (0 && I.n == J.n) {
 		struct bits IN = bits(in, I.n);
 		struct bits JN = bits(in, J.n);
 
@@ -1079,16 +1281,16 @@ static int keccak_collision(
 			OP_CALL_ARR(I_neq_J),
 		};
 
-		return instance_run(in, &OP_CALL_ARR(coll0));
+		return instance_run(in, &OP_CALL_ARR(coll0), o);
 	} else {
-		return instance_run(in, &OP_CALL_ARR(coll));
+		return instance_run(in, &OP_CALL_ARR(coll), o);
 	}
 }
 
 int main(int argc, char **argv)
 {
 	struct instance in = INSTANCE_INIT;
-	unsigned i;
+	unsigned i, j;
 	int ret;
 	FILE *sol = NULL;
 
@@ -1113,30 +1315,78 @@ int main(int argc, char **argv)
 		}
 	}
 
+	struct out o;
+#if 1
+	memset(&in.cnf, 0, sizeof(in.cnf));
+	o.bit_out    = dimacs_cnf_bit_out;
+	o.constr_out = dimacs_cnf_constr_out;
+	o.p          = &in.cnf;
+#else
+	o.bit_out    = dot_bit_out;
+	o.constr_out = dot_constr_out;
+	o.p          = stdout;
+	fprintf(o.p, "digraph G {\n");
+#endif
+
 	switch (argv[1][0]) {
 	case 'p':
-		I = bits(&in, rate == 40 ? 4 * rate - 2 : rate - 16);
+		I = bits(&in, rate == 40 ? 3 * rate - 2 : rate - 16);
 		O = bits(&in, 80);
-		ret = keccak_preimage(&in, I, O);
+		ret = keccak_preimage(&in, I, O, &o);
 		break;
 	case 'c':
-		i_n = rate == 40 ? 4 * rate - 2 : rate - 16;
-		j_n = rate == 40 ? 4 * rate - 3 : rate - 17;
+		i_n = rate == 40 ? 4 * rate - 2 : rate - 8;
+		j_n = rate == 40 ? 4 * rate - 3 : rate - 9;
 		I = bits(&in, i_n);
 		J = bits(&in, j_n);
 		O = bits(&in, 160);
 		P = bits(&in, 160);
-		ret = keccak_collision(&in, I, J, O, P);
+		ret = keccak_collision(&in, I, J, O, P, &o);
 		break;
 	default:
 		fprintf(stderr, "invalid mode of operation: %s\n", argv[1]);
 		exit(EXIT_FAILURE);
 	}
+	//fprintf(o.p, "}\n");
+	//fclose(o.p);
 	if (ret)
 		goto done;
 
 	fprintf(stderr, "var summary: %u and, %u or, %u xor, %u anti, %u equi, %u free\n",
 		stat.and, stat.or, stat.xor, stat.anti, stat.equi, stat.free);
+
+	for (i=0; i<12; i++)
+		switch (i) {
+		case AND:
+		case OR:
+		case XOR:
+			fprintf(stderr, "%s b: ", op_names[i]);
+			for (j=0; j<12; j++)
+				switch (j) {
+				case AND:
+				case OR:
+				case XOR:
+				case NOT:
+				case SET:
+				case VAR:
+					fprintf(stderr, "%s: %u, ", op_names[j], par_stat[i].b[j]);
+				}
+			fprintf(stderr, "\n");
+		case NOT:
+		case SET:
+			fprintf(stderr, "%s a: ", op_names[i]);
+			for (j=0; j<12; j++)
+				switch (j) {
+				case AND:
+				case OR:
+				case XOR:
+				case NOT:
+				case SET:
+				case VAR:
+					fprintf(stderr, "%s: %u, ", op_names[j], par_stat[i].a[j]);
+				}
+			fprintf(stderr, "\n");
+		}
 
 	/* mode of operation: CNF generation vs. solution compilation */
 	if (!sol) {
@@ -1151,8 +1401,7 @@ int main(int argc, char **argv)
 		signed var;
 		bb_t mem[(in.total_bits + bb_t_bits - 1) / bb_t_bits];
 
-		fscanf(sol, "%s\n", buf);
-		if (strncmp("SAT", buf, 3)) {
+		if (fscanf(sol, "%s\n", buf) < 1 || strncmp("SAT", buf, 3)) {
 			fprintf(stderr, "supplied file does not contain a solution: %s\n", buf);
 			ret = EXIT_FAILURE;
 			goto done;
