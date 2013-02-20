@@ -1,4 +1,6 @@
 
+#define _POSIX_C_SOURCE	200809L	/* opt{arg,ind,opt} */
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,8 +8,11 @@
 #include <stdarg.h>
 #include <assert.h>
 #include <stddef.h>
+#include <unistd.h>	/* getopt */
 
-// typedef unsigned long bit_t;
+static unsigned rate, cap, rounds;
+static unsigned coll_ensure_unequal = 0;
+static unsigned constant_folding = 1;
 
 struct bits {
 	unsigned o, n;
@@ -493,7 +498,7 @@ static signed bit_fold(const struct opxform *x, unsigned a)
 {
 	struct bitxform *ax = x->xf + a;
 
-	if (0)
+	if (!constant_folding)
 		return a;
 
 	if (!ax->folded_value)
@@ -819,7 +824,6 @@ static void print_bits(const char *name, const struct bits *b)
 struct instance {
 	unsigned total_bits;
 	struct opxform *x;
-	struct dimacs_cnf cnf;
 };
 
 static int dot_bit_out(void *p, enum op_t op, unsigned a, signed ta, signed tb)
@@ -861,7 +865,7 @@ static int dot_constr_out(void *p, unsigned n, const signed *l)
 	return 0;
 }
 
-#define INSTANCE_INIT	(struct instance){ 0, NULL, DIMACS_CNF_INIT }
+#define INSTANCE_INIT	(struct instance){ 0, NULL }
 
 static int instance_run(
 	struct instance *in, const struct operation *op, const struct out *o
@@ -883,7 +887,7 @@ struct keccak {
 	unsigned w, r, c, rounds;
 	struct bits RC;
 	struct bits S, B, C, D, t, b;
-	struct operation *absorb, *f, *round, *squeeze;
+	struct operation *absorb, *f, *round/*, *squeeze*/;
 };
 
 static void keccak_init(
@@ -1099,13 +1103,13 @@ static void keccak_init_full(
 	struct keccak *kc,
 	struct instance *in,
 	unsigned r, unsigned c, unsigned rounds,
-	struct bits M, struct bits O
+	struct bits M/*, struct bits O*/
 ) {
 	keccak_init(kc, in, r, c, rounds);
 	kc->round   = keccak_round(kc, in);
 	kc->f       = keccak_f(kc, kc->round);
 	kc->absorb  = keccak_input(kc, in, M, kc->f);
-	kc->squeeze = keccak_output(kc, in, O, kc->f);
+	// kc->squeeze = keccak_output(kc, in, O, kc->f);
 }
 
 union bc {
@@ -1175,8 +1179,6 @@ static const union bc out_r1440[] = {
  *   - SET, NOT, VAR, EXPECT?
  * - modify keccak_output to apply EXPECT directly instead of SET'ing O */
 
-static unsigned rate, cap, rounds;
-
 static int keccak_preimage(struct instance *in, struct bits I, struct bits O, const struct out *o)
 {
 	struct keccak kc;
@@ -1193,9 +1195,9 @@ static int keccak_preimage(struct instance *in, struct bits I, struct bits O, co
 		exit(EXIT_FAILURE);
 	}
 
-	struct bits P = bits(in, O.n);
+	// struct bits P = bits(in, O.n);
 
-	keccak_init_full(&kc, in, rate, cap, rounds, I, P);
+	keccak_init_full(&kc, in, rate, cap, rounds, I/*, P*/);
 
 	struct bits S = kc.S;
 
@@ -1215,19 +1217,9 @@ static int keccak_preimage(struct instance *in, struct bits I, struct bits O, co
 		OP_VAR(S),
 #else
 		OP_SET0(S),
-#if 0
-		{ XOR, kc.r, S.o, S.o, I.o },
-		*f,/*
-		{ XOR, kc.r, S.o, S.o, I.o + kc.r },
-		*f,*/
-#else
 		*kc.absorb,
 #endif
-#endif
 		kc.r == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
-		// *kc.squeeze,
-
-		// OP_EXPECT(P,O), /* worse than w/o squeeze */
 	};
 
 	return instance_run(in, &OP_CALL_ARR(ops), o);
@@ -1237,13 +1229,29 @@ static int keccak_preimage(struct instance *in, struct bits I, struct bits O, co
 
 static int keccak_collision(
 	struct instance *in,
-	struct bits I, struct bits J, struct bits O, struct bits P,
+	struct bits I, struct bits J,
 	const struct out *o
 ) {
 	struct keccak kc0, kc1;
 
-	keccak_init_full(&kc0, in, rate, cap, rounds, I, O);
-	keccak_init_full(&kc1, in, rate, cap, rounds, J, P);
+	keccak_init_full(&kc0, in, rate, cap, rounds, I);
+	keccak_init_full(&kc1, in, rate, cap, rounds, J);
+
+	struct operation op_expect_40[] = {
+		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
+		*kc0.f,
+		*kc1.f,
+		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
+		*kc0.f,
+		*kc1.f,
+		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
+		*kc0.f,
+		*kc1.f,
+		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
+	};
+	struct operation op_expect_n[] = {
+		{ EXPECT, 160, 0, kc0.S.o, kc1.S.o },
+	};
 
 	struct operation coll[] = {
 		OP_VAR(I),
@@ -1257,13 +1265,13 @@ static int keccak_collision(
 
 		// *kc0.squeeze,
 		// *kc1.squeeze,
-
-		/* TODO: only for >= 240 */
-		{ EXPECT, kc0.S.n/*160*/, 0, kc0.S.o, kc1.S.o },
 		// OP_EXPECT(O,P), /* time worse for c 640 160 2 than w/o squeeze */
+
+		// { EXPECT, kc0.S.n/*160*/, 0, kc0.S.o, kc1.S.o },
+		rate == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
 	};
 
-	if (0 && I.n == J.n) {
+	if (coll_ensure_unequal && I.n == J.n) {
 		struct bits IN = bits(in, I.n);
 		struct bits JN = bits(in, J.n);
 
@@ -1287,72 +1295,143 @@ static int keccak_collision(
 	}
 }
 
+static void usage(const char *progname)
+{
+	fprintf(stderr, "usage: %s [-OPTS] {p|c} RATE CAP ROUNDS [SOLUTION]\n",
+		progname);
+	fprintf(stderr, "\n"
+			"  -c    DIMACS CNF output format [default]\n"
+			"  -d    dot(1) output format instead of DIMACS CNF\n"
+			"  -F    disable constant folding\n"
+			"  -h    show this help message\n"
+			"  -i N  set size in bits of (first, for 'c') input\n"
+			"  -j N  set size in bits of second ('c') input\n"
+			"  -u    ensure unequality of two collision inputs\n"
+	);
+	exit(EXIT_FAILURE);
+}
+
 int main(int argc, char **argv)
 {
 	struct instance in = INSTANCE_INIT;
+	struct dimacs_cnf cnf = DIMACS_CNF_INIT;
+	struct out o;
 	unsigned i, j;
-	int ret;
+	int ret = EXIT_SUCCESS;
 	FILE *sol = NULL;
+	int opt;
+	enum {
+		OUT_CNF = 'c',
+		OUT_DOT = 'd',
+	} output_fmt = OUT_CNF;
+	enum {
+		ATTACK_PREIMAGE = 'p',
+		ATTACK_COLLISION = 'c',
+	} attack_mode;
 
 	unsigned i_n, j_n; /* TODO */
 
-	struct bits I, J, O, P;
+	struct bits I, J, O;
 
-	if (5 > argc || argc > 6) {
-		fprintf(stderr, "usage: %s {p|c} RATE CAP ROUNDS [SOLUTION]\n", argv[0]);
-		exit(EXIT_FAILURE);
-	}
-
-	rate = atoi(argv[2]);   /* {,2,6,14}40 */
-	cap = atoi(argv[3]);    /* 160 */
-	rounds = atoi(argv[4]); /* 1 */
-
-	if (argc > 5) {
-		sol = fopen(argv[5], "r");
-		if (!sol) {
-			perror(argv[5]);
+	while ((opt = getopt(argc, argv, ":cdFhi:j:u")) != -1) {
+		switch (opt) {
+		case 'c':
+		case 'd':
+			output_fmt = opt;
+			break;
+		case 'F':
+			constant_folding = 0;
+			break;
+		case 'h':
+			usage(argv[0]);
+		case 'i':
+			if ((i_n = atoi(optarg)) < 0) {
+				fprintf(stderr, "-i needs an argument > 0\n");
+				exit(EXIT_FAILURE);
+			}
+			break;
+		case 'j':
+			if ((i_n = atoi(optarg)) < 0) {
+				fprintf(stderr, "-j needs an argument > 0\n");
+				exit(EXIT_FAILURE);
+			}
+			break;
+		case 'u':
+			coll_ensure_unequal = 1;
+			break;
+		case ':':
+			fprintf(stderr, "option -%c requires an argument\n",
+				optopt);
+			exit(EXIT_FAILURE);
+		case '?':
+			fprintf(stderr, "unrecognized option -%c\n", optopt);
 			exit(EXIT_FAILURE);
 		}
 	}
 
-	struct out o;
-#if 1
-	memset(&in.cnf, 0, sizeof(in.cnf));
-	o.bit_out    = dimacs_cnf_bit_out;
-	o.constr_out = dimacs_cnf_constr_out;
-	o.p          = &in.cnf;
-#else
-	o.bit_out    = dot_bit_out;
-	o.constr_out = dot_constr_out;
-	o.p          = stdout;
-	fprintf(o.p, "digraph G {\n");
-#endif
+	if (argc - optind < 4 || argc - optind > 5)
+		usage(argv[0]);
 
-	switch (argv[1][0]) {
+	switch (argv[optind][0]) {
 	case 'p':
+	case 'c':
+		attack_mode = argv[optind][0];
+		break;
+	default:
+		fprintf(stderr, "unrecognized attack mode: '%s'\n",
+			argv[optind]);
+		exit(EXIT_FAILURE);
+	}
+
+	rate = atoi(argv[optind+1]);   /* {,2,6,14}40 */
+	cap = atoi(argv[optind+2]);    /* 160 */
+	rounds = atoi(argv[optind+3]); /* 1+ */
+
+	if (optind + 4 < argc) {
+		sol = fopen(argv[optind+4], "r");
+		if (!sol) {
+			perror(argv[optind+4]);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	switch (output_fmt) {
+	case OUT_CNF:
+		o.bit_out    = dimacs_cnf_bit_out;
+		o.constr_out = dimacs_cnf_constr_out;
+		o.p          = &cnf;
+		break;
+	case OUT_DOT:
+		o.bit_out    = dot_bit_out;
+		o.constr_out = dot_constr_out;
+		o.p          = stdout;
+		fprintf(o.p, "digraph G {\n");
+		break;
+	}
+
+	switch (attack_mode) {
+	case ATTACK_PREIMAGE:
 		I = bits(&in, rate == 40 ? 3 * rate - 2 : rate - 16);
 		O = bits(&in, 80);
 		ret = keccak_preimage(&in, I, O, &o);
 		break;
-	case 'c':
+	case ATTACK_COLLISION:
 		i_n = rate == 40 ? 4 * rate - 2 : rate - 8;
 		j_n = rate == 40 ? 4 * rate - 3 : rate - 9;
 		I = bits(&in, i_n);
 		J = bits(&in, j_n);
-		O = bits(&in, 160);
-		P = bits(&in, 160);
-		ret = keccak_collision(&in, I, J, O, P, &o);
+		ret = keccak_collision(&in, I, J, &o);
 		break;
-	default:
-		fprintf(stderr, "invalid mode of operation: %s\n", argv[1]);
-		exit(EXIT_FAILURE);
 	}
-	//fprintf(o.p, "}\n");
-	//fclose(o.p);
+	if (output_fmt == OUT_DOT) {
+		fprintf(o.p, "}\n");
+		fclose(o.p);
+	}
 	if (ret)
 		goto done;
 
-	fprintf(stderr, "var summary: %u and, %u or, %u xor, %u anti, %u equi, %u free\n",
+	fprintf(stderr,
+		"var summary: %u and, %u or, %u xor, %u anti, %u equi, %u free\n",
 		stat.and, stat.or, stat.xor, stat.anti, stat.equi, stat.free);
 
 	for (i=0; i<12; i++)
@@ -1393,7 +1472,7 @@ int main(int argc, char **argv)
 		FILE *o = stdout;
 		fprintf(o, "c rate: %u, cap: %u, rounds: %u, I.n: %u, J.n: %u\n",
 			rate, cap, rounds, I.n, J.n);
-		dimacs_cnf_print(o, &in.cnf);
+		dimacs_cnf_print(o, &cnf);
 	} else {
 		/* assuming minisat, which unfortunately got an output format
 		 * that differs from DIMACS */
@@ -1416,13 +1495,13 @@ int main(int argc, char **argv)
 				bb_put(mem, var < 0 ? 0 : 1, vx->a, 1);
 		}
 
-		switch (argv[1][0]) {
-		case 'c':
+		switch (attack_mode) {
+		case ATTACK_COLLISION:
 			printf("J %d bits, %d bytes: ", J.n, (J.n + 7) / 8);
 			for (i=J.o; i<J.o+J.n; i+=8)
 				printf("\\x%02lx", bb_get(mem, i, 8));
 			printf("\n");
-		case 'p':
+		case ATTACK_PREIMAGE:
 			printf("I %d bits, %d bytes: ", I.n, (I.n + 7) / 8);
 			for (i=I.o; i<I.o+I.n; i+=8)
 				printf("\\x%02lx", bb_get(mem, i, 8));
