@@ -29,7 +29,7 @@ struct operation {
 		XOR,        /* n,r,a,b */
 		NOT,        /* n,r,a */
 		ROL,        /* n,r,a,b */
-		CALL,       /* n,tgt */
+		CALL,       /* tgt */
 		EXPECT,     /* n,a,b */
 		EXPECT_ANY, /* n,a */
 	//	FIX,        /* n,r,a */
@@ -40,9 +40,60 @@ struct operation {
 		LOAD,       /* n,r,a,v */
 	} op;
 	unsigned n, r, a, b;
-	const struct operation *tgt;
+	struct operation *tgt;
 	const bb_t *v;
+	struct operation *next;
 };
+
+static struct operation * op_dup(const struct operation *o)
+{
+	struct operation *r = malloc(sizeof(struct operation));
+	if (!r) {
+		perror("malloc");
+		exit(EXIT_FAILURE);
+	}
+	memcpy(r, o, sizeof(*r));
+	r->next = NULL;
+	return r;
+}
+
+static struct operation * op_app(const struct operation *o, struct operation ***tail)
+{
+	struct operation *r = op_dup(o);
+	**tail = r;
+	*tail = &r->next;
+	return r;
+}
+
+static struct operation * op_arr2list(unsigned n, const struct operation *o, struct operation ***tail)
+{
+	struct operation *r = NULL;
+	struct operation **t = &r;
+
+	if (!n)
+		return NULL;
+
+	while (n--)
+		op_app(o++, &t);
+
+	if (tail) {
+		**tail = r;
+		*tail = t;
+	}
+
+	return r;
+}
+
+static void op_list_free_deep(struct operation *o)
+{
+	struct operation *on;
+	for (; o; o = on) {
+		if (o->op == CALL)
+			op_list_free_deep(o->tgt);
+		on = o->next;
+		free(o);
+	}
+}
 
 static const char *op_names[] = {
 	"and", "or", "xor", "not", "rol", "call", "expect", "expect_any",
@@ -73,8 +124,7 @@ static struct op_flags {
 #define OP_XOR(out,b0,b1) (struct operation){ XOR, (out).n, (out).o, (b0).o, (b1).o }
 #define OP_NOT(out,b0)    (struct operation){ NOT, (out).n, (out).o, (b0).o }
 #define OP_ROL(out,b0,m)  (struct operation){ ROL, (out).n, (out).o, (b0).o, (m) }
-#define OP_CALL(n,target) (struct operation){ CALL, (n), .tgt = (target) }
-#define OP_CALL_ARR(arr)  OP_CALL(ARRAY_SIZE(arr),arr)
+#define OP_CALL(target)   (struct operation){ CALL, .tgt = (target) }
 #define OP_EXPECT(b,c)    (struct operation){ EXPECT, (b).n, 0, (b).o, (c).o }
 #define OP_EXPECT_ANY(a)  (struct operation){ EXPECT_ANY, (a).n, 0, (a).o }
 #define OP_VAR(b)         (struct operation){ VAR, (b).n, (b).o }
@@ -672,7 +722,9 @@ struct exec_plan {
 };
 #endif
 
-static int opx_exec(struct opxform *x, const struct operation *op, const struct out *o)
+static int opx_exec(struct opxform *x, const struct operation *op, const struct out *o);
+
+static int opx_exec_single(struct opxform *x, const struct operation *op, const struct out *o)
 {
 	unsigned i, k, n, b;
 	int r = 0;
@@ -680,6 +732,7 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 	struct op_flags of = op_flags[op->op];
 
 	n = op->n;
+	k = 0; /* suppress unwarranted warning about possibly uninitialized use */
 
 	/* check validity of memory references */
 	for (i=0; i<n; i++) {
@@ -741,12 +794,7 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 		}
 		break;
 	case CALL:
-		for (i=0; i<n; i++)
-			if ((r = opx_exec(x, op->tgt + i, o)) != 0) {
-				fprintf(stderr, "call stack %u: op %p: %s\n",
-					i, (void *)op, opstr(op));
-				break;
-			}
+		r = opx_exec(x, op->tgt, o);
 		break;
 	case EXPECT:
 		fprintf(stderr, "expect, current ssa vars: %u, op: %s\n",
@@ -764,8 +812,10 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 		}
 #else
 		for (i=0; i<n; i++) {
-			unsigned v = x->mem2xf[op->a + i];
-			unsigned e = x->mem2xf[op->b + i];
+			signed vf = bit_fold(x, x->mem2xf[op->a + i]);
+			signed ef = bit_fold(x, x->mem2xf[op->b + i]);
+			unsigned v = vf < 0 ? -vf : vf;
+			unsigned e = ef < 0 ? -ef : ef;
 			if ((r = bit_resolve(x, v, o)) != 0) {
 				fprintf(stderr, "ERROR: offending operation: %s\n", opstr(op));
 				break;
@@ -775,8 +825,8 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 				break;
 			}
 			// dimacs_cnf_eq(cnf, v, e);
-			o->constr_out(o, 2, (signed[]){  v, -e });
-			o->constr_out(o, 2, (signed[]){ -v,  e });
+			o->constr_out(o, 2, (signed[]){  vf, -ef });
+			o->constr_out(o, 2, (signed[]){ -vf,  ef });
 		}
 #endif
 		break;
@@ -786,9 +836,10 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 		/* TODO! */
 		l = malloc(sizeof(signed)*n);
 		for (i=0; i<n; i++) {
-			unsigned v = x->mem2xf[op->a + i];
+			signed vf = bit_fold(x, x->mem2xf[op->a + i]);
+			unsigned v = vf < 0 ? -vf : vf;
 			bit_resolve(x, v, o);
-			l[i] = v;
+			l[i] = vf;
 		}
 		// dimacs_cnf_add(o->p, c);
 		o->constr_out(o, n, l);
@@ -810,6 +861,21 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 		for (i=0; i<n; i++)
 			x->mem2xf[op->r + i] = k + i;
 	}
+
+	return r;
+}
+
+static int opx_exec(struct opxform *x, const struct operation *op, const struct out *o)
+{
+	unsigned i;
+	int r = 0;
+
+	for (i=0; op; i++, op = op->next)
+		if ((r = opx_exec_single(x, op, o)) != 0) {
+			fprintf(stderr, "call stack %u: op %p: %s\n",
+				i, (void *)op, opstr(op));
+			break;
+		}
 
 	return r;
 }
@@ -888,10 +954,9 @@ static int dot_constr_out_ext(const struct out *o, unsigned n, const signed *l)
 static int instance_run(
 	struct instance *in, const struct operation *op, const struct out *o
 ) {
-	in->x      = opx_init(in->total_bits);
+	in->x = opx_init(in->total_bits);
 
-	int r = opx_exec(in->x, op, o); /* TODO: param: _const_ struct out *o */
-	return r;
+	return opx_exec(in->x, op, o);
 }
 
 struct bits bits(struct instance *in, unsigned n)
@@ -905,7 +970,7 @@ struct keccak {
 	unsigned w, r, c, rounds;
 	struct bits RC;
 	struct bits S, B, C, D, t, b;
-	struct operation *absorb, *f, *round/*, *squeeze*/;
+	struct operation *absorb, *f, *round, *squeeze;
 };
 
 static void keccak_init(
@@ -969,16 +1034,15 @@ static struct operation * keccak_f(
 		[23] = 0x8000000080008008,
 	};
 
-	struct operation *f = malloc(sizeof(struct operation) * (1 + 2 * kc->rounds));
+	struct operation *f = NULL, **tail = &f;
 	unsigned i;
 
-	f[0] = OP_CALL(2 * kc->rounds, f + 1);
 	for (i=0; i<kc->rounds; i++) {
-		f[2*i+1] = OP_LOAD(kc->RC, i * bb_t_bits, keccak_RC);
-		f[2*i+2] = *call_round;
+		op_app(&OP_LOAD(kc->RC, i * bb_t_bits, keccak_RC), &tail);
+		op_app(call_round, &tail);
 	}
 
-	return f;
+	return op_dup(&OP_CALL(f));
 }
 
 struct operation * keccak_round(const struct keccak *kc, struct instance *in)
@@ -1053,10 +1117,8 @@ struct operation * keccak_round(const struct keccak *kc, struct instance *in)
 		{ XOR, z, A(0,0), A(0,0), kc->RC.o },
 	};
 
-	struct operation *f = malloc(sizeof(struct operation) + sizeof(keccak_round));
-	f[0] = OP_CALL(ARRAY_SIZE(keccak_round), f + 1);
-	memcpy(f + 1, keccak_round, sizeof(keccak_round));
-	return f;
+	return op_dup(&OP_CALL(
+		op_arr2list(ARRAY_SIZE(keccak_round), keccak_round, NULL)));
 }
 
 /* absorbing phase */
@@ -1068,7 +1130,9 @@ static struct operation * keccak_input(
 ) {
 	unsigned loops = (M.n + 2 + kc->r - 1) / kc->r;
 	struct bits P = bits(in, kc->r * loops);
-	unsigned i, k;
+	unsigned i;
+
+	struct operation *r = NULL, **tail = &r;
 
 	/* P = I10*1 : w divides |P| */
 	struct operation p_prep[] = {
@@ -1078,19 +1142,14 @@ static struct operation * keccak_input(
 		{ NOT,   1, P.o + P.n - 1, P.o + P.n - 1 },
 	};
 
-	struct operation *f = malloc(
-		sizeof(struct operation) * (1 + 2 * loops) + sizeof(p_prep));
+	op_arr2list(ARRAY_SIZE(p_prep), p_prep, &tail);
 
-	f[0] = OP_CALL(ARRAY_SIZE(p_prep) + 2 * loops, f + 1);
-	memcpy(f + 1, p_prep, sizeof(p_prep));
-
-	k = 1 + ARRAY_SIZE(p_prep);
 	for (i=0; i<loops; i++) {
-		f[k++] = (struct operation){ XOR, kc->r, kc->S.o, kc->S.o, P.o + i*kc->r };
-		f[k++] = *call_keccak_f;
+		op_app(&(struct operation){ XOR, kc->r, kc->S.o, kc->S.o, P.o + i*kc->r }, &tail);
+		op_app(call_keccak_f, &tail);
 	}
 
-	return f;
+	return op_dup(&OP_CALL(r));
 }
 
 static struct operation * keccak_output(
@@ -1100,34 +1159,32 @@ static struct operation * keccak_output(
 	const struct operation *call_keccak_f
 ) {
 	unsigned loops = (O.n + kc->r - 1) / kc->r;
-	unsigned i, k, n = O.n;
+	unsigned i, n = O.n;
 
 	assert(loops >= 1);
 
-	struct operation *f = malloc(
-		sizeof(struct operation) * (1 + (loops - 1) * 2 + 1));
+	struct operation *r = NULL, **tail = &r;
 
-	f[0] = OP_CALL((loops - 1) * 2 + 1, f + 1);
 	for (i=0; i<loops-1; i++, n-=kc->r) {
-		f[1+2*i  ] = (struct operation){ SET, kc->r, O.o + kc->r * i, kc->S.o };
-		f[1+2*i+1] = *call_keccak_f;
+		op_app(&(struct operation){ SET, kc->r, O.o + kc->r * i, kc->S.o }, &tail);
+		op_app(call_keccak_f, &tail);
 	}
-	f[1+2*i] = (struct operation){ SET, n, O.o + kc->r * i, kc->S.o };
+	op_app(&(struct operation){ SET, n, O.o + kc->r * i, kc->S.o }, &tail);
 
-	return f;
+	return op_dup(&OP_CALL(r));
 }
 
 static void keccak_init_full(
 	struct keccak *kc,
 	struct instance *in,
 	unsigned r, unsigned c, unsigned rounds,
-	struct bits M/*, struct bits O*/
+	struct bits M, struct bits O
 ) {
 	keccak_init(kc, in, r, c, rounds);
 	kc->round   = keccak_round(kc, in);
 	kc->f       = keccak_f(kc, kc->round);
 	kc->absorb  = keccak_input(kc, in, M, kc->f);
-	// kc->squeeze = keccak_output(kc, in, O, kc->f);
+	kc->squeeze = keccak_output(kc, in, O, kc->f);
 }
 
 union bc {
@@ -1213,36 +1270,28 @@ static int keccak_preimage(struct instance *in, struct bits I, struct bits O, co
 		exit(EXIT_FAILURE);
 	}
 
-	// struct bits P = bits(in, O.n);
+	struct bits P = bits(in, O.n);
 
-	keccak_init_full(&kc, in, rate, cap, rounds, I/*, P*/);
-
-	struct bits S = kc.S;
-
-	struct operation op_expect_40[] = {
-		{ EXPECT, 40, 0, S.o, O.o },
-		*kc.f,
-		{ EXPECT, 40, 0, S.o, O.o + 40 },
-	};
-	struct operation op_expect_n[] = {
-		{ EXPECT, 80, 0, S.o, O.o },
-	};
+	keccak_init_full(&kc, in, rate, cap, rounds, I, P);
 
 	struct operation ops[] = {
 		OP_VAR(I),
 		OP_LOAD(O,0,out_r[kc.rounds].b),
-#if 0
-		OP_VAR(S),
-#else
-		OP_SET0(S),
+#if 1
+		OP_SET0(kc.S),
 		*kc.absorb,
+#else
+		OP_VAR(kc.S),
 #endif
-		kc.r == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
+		*kc.squeeze,
+		OP_EXPECT(P,O),
 	};
 
-	return instance_run(in, &OP_CALL_ARR(ops), o);
+	struct operation *r = op_arr2list(ARRAY_SIZE(ops), ops, NULL);
 
-	// keccak_free(&kc)
+	int ret = instance_run(in, r, o);
+	op_list_free_deep(r);
+	return ret;
 }
 
 static int keccak_collision(
@@ -1251,25 +1300,13 @@ static int keccak_collision(
 	const struct out *o
 ) {
 	struct keccak kc0, kc1;
+	struct bits O = bits(in, state_bits_equal);
+	struct bits P = bits(in, state_bits_equal);
 
-	keccak_init_full(&kc0, in, rate, cap, rounds, I);
-	keccak_init_full(&kc1, in, rate, cap, rounds, J);
+	keccak_init_full(&kc0, in, rate, cap, rounds, I, O);
+	keccak_init_full(&kc1, in, rate, cap, rounds, J, P);
 
-	struct operation op_expect_40[] = {
-		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
-		*kc0.f,
-		*kc1.f,
-		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
-		*kc0.f,
-		*kc1.f,
-		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
-		*kc0.f,
-		*kc1.f,
-		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
-	};
-	struct operation op_expect_n[] = {
-		{ EXPECT, state_bits_equal, 0, kc0.S.o, kc1.S.o },
-	};
+	struct operation *r = NULL, **tail = &r;
 
 	struct operation coll[] = {
 		OP_VAR(I),
@@ -1285,16 +1322,12 @@ static int keccak_collision(
 		*kc0.absorb,
 		*kc1.absorb,
 
-		// *kc0.squeeze,
-		// *kc1.squeeze,
-		// OP_EXPECT(O,P), /* time worse for c 640 160 2 than w/o squeeze */
-
-#if 1
-		rate == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
-#else
-		OP_EXPECT(kc0.S, kc1.S),
-#endif
+		*kc0.squeeze,
+		*kc1.squeeze,
+		OP_EXPECT(O,P),
 	};
+
+	op_arr2list(ARRAY_SIZE(coll), coll, &tail);
 
 	if (coll_ensure_unequal && I.n == J.n) {
 		struct bits IN = bits(in, I.n);
@@ -1313,15 +1346,12 @@ static int keccak_collision(
 			OP_EXPECT_ANY(IN),
 		};
 
-		struct operation coll0[] = {
-			OP_CALL_ARR(coll),
-			OP_CALL_ARR(I_neq_J),
-		};
-
-		return instance_run(in, &OP_CALL_ARR(coll0), o);
-	} else {
-		return instance_run(in, &OP_CALL_ARR(coll), o);
+		op_arr2list(ARRAY_SIZE(I_neq_J), I_neq_J, &tail);
 	}
+
+	int ret = instance_run(in, r, o);
+	op_list_free_deep(r);
+	return ret;
 }
 
 static void usage(const char *progname)
