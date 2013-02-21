@@ -525,12 +525,12 @@ static int bit_resolve(const struct opxform *x, unsigned a, const struct out *o)
 
 	if (a == OPX_FALSE) {
 		// dimacs_cnf_addn(cnf, -a);
-		o->constr_out(o->p, 1, (signed[]){ -a });
+		o->constr_out(o, 1, (signed[]){ -a });
 		goto done;
 	}
 	if (a == OPX_TRUE) {
 		// dimacs_cnf_addn(cnf,  a);
-		o->constr_out(o->p, 1, (signed[]){  a });
+		o->constr_out(o, 1, (signed[]){  a });
 		goto done;
 	}
 
@@ -587,7 +587,7 @@ static int bit_resolve(const struct opxform *x, unsigned a, const struct out *o)
 	default:;
 	}
 
-	r = o->bit_out(o->p, op, a, ta, tb);
+	r = o->bit_out(o, op, a, ta, tb);
 
 done:
 	/* mark ax as 'already resolved' */
@@ -676,7 +676,7 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 {
 	unsigned i, k, n, b;
 	int r = 0;
-	struct clause *c;
+	signed *l;
 	struct op_flags of = op_flags[op->op];
 
 	n = op->n;
@@ -775,8 +775,8 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 				break;
 			}
 			// dimacs_cnf_eq(cnf, v, e);
-			o->constr_out(o->p, 2, (signed[]){  v, -e });
-			o->constr_out(o->p, 2, (signed[]){ -v,  e });
+			o->constr_out(o, 2, (signed[]){  v, -e });
+			o->constr_out(o, 2, (signed[]){ -v,  e });
 		}
 #endif
 		break;
@@ -784,16 +784,15 @@ static int opx_exec(struct opxform *x, const struct operation *op, const struct 
 		fprintf(stderr, "expect_any, current ssa vars: %u, op: %s\n",
 			x->xf_n, opstr(op));
 		/* TODO! */
-		c = malloc(offsetof(struct clause,l) + sizeof(signed)*n);
-		c->n = n;
+		l = malloc(sizeof(signed)*n);
 		for (i=0; i<n; i++) {
 			unsigned v = x->mem2xf[op->a + i];
 			bit_resolve(x, v, o);
-			c->l[i] = v;
+			l[i] = v;
 		}
 		// dimacs_cnf_add(o->p, c);
-		o->constr_out(o->p, n, c->l);
-		free(c);
+		o->constr_out(o, n, l);
+		free(l);
 		break;
 	}
 
@@ -826,20 +825,32 @@ struct instance {
 	struct opxform *x;
 };
 
-static int dot_bit_out(void *p, enum op_t op, unsigned a, signed ta, signed tb)
+static int dot_init(const struct out *o, const char *comment)
+{
+	fprintf(o->f, "digraph G {\n\t// %s\n", comment);
+	return 0;
+}
+
+static int dot_fini(const struct out *o)
+{
+	fprintf(o->f, "}\n");
+	return 0;
+}
+
+static int dot_bit_out(const struct out *o, enum op_t op, unsigned a, signed ta, signed tb)
 {
 	switch (op) {
 	case AND:
 	case OR:
 	case XOR:
-		fprintf(p, "\t%u -> %d\n", a, tb);
+		fprintf(o->f, "\t%u -> %d\n", a, tb);
 	case NOT:
 	case SET:
-		fprintf(p, "\t%u -> %d\n", a, ta);
-		fprintf(p, "\t%u [label=\"%u %s\"]\n", a, a, op_names[op]);
+		fprintf(o->f, "\t%u -> %d\n", a, ta);
+		fprintf(o->f, "\t%u [label=\"%u %s\"]\n", a, a, op_names[op]);
 		break;
 	case VAR:
-		fprintf(p, "\t%u [style=filled,color=green]\n", a);
+		fprintf(o->f, "\t%u [style=filled,color=green]\n", a);
 		break;
 	default:
 		return 1;
@@ -847,19 +858,26 @@ static int dot_bit_out(void *p, enum op_t op, unsigned a, signed ta, signed tb)
 	return 0;
 }
 
-static int dot_constr_out(void *p, unsigned n, const signed *l)
+static int dot_constr_out(const struct out *o, unsigned n, const signed *l)
+{
+	while (n--)
+		fprintf(o->f, "\t%d [style=filled,color=red]\n", *l++);
+	return 0;
+}
+
+static int dot_constr_out_ext(const struct out *o, unsigned n, const signed *l)
 {
 	static int or_n = 0;
 	if (n == 2) {
-		fprintf(p, "\t%d [style=filled,color=red]\n", l[0]);
-		fprintf(p, "\t%d [style=filled,color=red]\n", l[1]);
-		fprintf(p, "\t%d -> %d [dir=both,label=\"=\",color=purple]\n", l[0], l[1]);
+		fprintf(o->f, "\t%d [style=filled,color=red]\n", l[0]);
+		fprintf(o->f, "\t%d [style=filled,color=red]\n", l[1]);
+		fprintf(o->f, "\t%d -> %d [dir=both,label=\"=\",color=purple]\n", l[0], l[1]);
 	} else {
-		fprintf(p, "\tor%u [label=\"or\",color=purple,shape=box]\n", ++or_n);
+		fprintf(o->f, "\tor%u [label=\"or\",color=purple,shape=box]\n", ++or_n);
 		while (n--) {
 			signed v = *l++;
-			fprintf(p, "%d [style=filled,color=red]\n", v);
-			fprintf(p, "\tor%u -> %d [color=purple]\n", or_n, v);
+			fprintf(o->f, "\t%d [style=filled,color=red]\n", v);
+			fprintf(o->f, "\tor%u -> %d [color=purple]\n", or_n, v);
 		}
 	}
 	return 0;
@@ -1229,7 +1247,7 @@ static int keccak_preimage(struct instance *in, struct bits I, struct bits O, co
 
 static int keccak_collision(
 	struct instance *in,
-	struct bits I, struct bits J,
+	struct bits I, struct bits J, unsigned state_bits_equal,
 	const struct out *o
 ) {
 	struct keccak kc0, kc1;
@@ -1250,12 +1268,16 @@ static int keccak_collision(
 		{ EXPECT, 40, 0, kc0.S.o, kc1.S.o },
 	};
 	struct operation op_expect_n[] = {
-		{ EXPECT, 160, 0, kc0.S.o, kc1.S.o },
+		{ EXPECT, state_bits_equal, 0, kc0.S.o, kc1.S.o },
 	};
 
 	struct operation coll[] = {
 		OP_VAR(I),
 		OP_VAR(J),
+
+		/* TODO: instead of the below: EXPECT_ANY on kc0.S[0:r-1) in the
+		 * last absorb round
+		 * (w/o -[ij]: use % rate to determine variable length part) */
 
 		OP_SET0(kc0.S),
 		OP_SET0(kc1.S),
@@ -1267,8 +1289,11 @@ static int keccak_collision(
 		// *kc1.squeeze,
 		// OP_EXPECT(O,P), /* time worse for c 640 160 2 than w/o squeeze */
 
-		// { EXPECT, kc0.S.n/*160*/, 0, kc0.S.o, kc1.S.o },
+#if 1
 		rate == 40 ? OP_CALL_ARR(op_expect_40) : OP_CALL_ARR(op_expect_n),
+#else
+		OP_EXPECT(kc0.S, kc1.S),
+#endif
 	};
 
 	if (coll_ensure_unequal && I.n == J.n) {
@@ -1276,11 +1301,15 @@ static int keccak_collision(
 		struct bits JN = bits(in, J.n);
 
 		struct operation I_neq_J[] = {
+#if 1
 			OP_NOT(IN, I),
 			OP_NOT(JN, J),
 			OP_AND(JN, I, JN),
 			OP_AND(IN, IN, J),
 			OP_OR(IN, IN, JN),
+#else
+			OP_XOR(IN, I, J);
+#endif
 			OP_EXPECT_ANY(IN),
 		};
 
@@ -1302,11 +1331,13 @@ static void usage(const char *progname)
 	fprintf(stderr, "\n"
 			"  -c    DIMACS CNF output format [default]\n"
 			"  -d    dot(1) output format instead of DIMACS CNF\n"
+			"  -D    dot(1) output format with additional nodes\n"
+			"  -e N  number of equal bits in state desired for collision mode [160]\n"
 			"  -F    disable constant folding\n"
 			"  -h    show this help message\n"
 			"  -i N  set size in bits of (first, for 'c') input\n"
 			"  -j N  set size in bits of second ('c') input\n"
-			"  -u    ensure unequality of two collision inputs\n"
+			"  -u    ensure unequality of the two collision inputs\n"
 	);
 	exit(EXIT_FAILURE);
 }
@@ -1323,21 +1354,29 @@ int main(int argc, char **argv)
 	enum {
 		OUT_CNF = 'c',
 		OUT_DOT = 'd',
+		OUT_DOT_EXT = 'D',
 	} output_fmt = OUT_CNF;
 	enum {
 		ATTACK_PREIMAGE = 'p',
 		ATTACK_COLLISION = 'c',
 	} attack_mode;
 
-	unsigned i_n, j_n; /* TODO */
+	int i_n = 0, j_n = 0, ceq = 160;
 
 	struct bits I, J, O;
 
-	while ((opt = getopt(argc, argv, ":cdFhi:j:u")) != -1) {
+	while ((opt = getopt(argc, argv, ":cdDe:Fhi:j:u")) != -1) {
 		switch (opt) {
 		case 'c':
 		case 'd':
+		case 'D':
 			output_fmt = opt;
+			break;
+		case 'e':
+			if ((ceq = atoi(optarg)) < 0) {
+				fprintf(stderr, "-e needs an argument >= 0\n");
+				exit(EXIT_FAILURE);
+			}
 			break;
 		case 'F':
 			constant_folding = 0;
@@ -1351,7 +1390,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'j':
-			if ((i_n = atoi(optarg)) < 0) {
+			if ((j_n = atoi(optarg)) < 0) {
 				fprintf(stderr, "-j needs an argument > 0\n");
 				exit(EXIT_FAILURE);
 			}
@@ -1383,8 +1422,8 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	rate = atoi(argv[optind+1]);   /* {,2,6,14}40 */
-	cap = atoi(argv[optind+2]);    /* 160 */
+	rate   = atoi(argv[optind+1]); /* {,2,6,14}40 */
+	cap    = atoi(argv[optind+2]); /* 160 */
 	rounds = atoi(argv[optind+3]); /* 1+ */
 
 	if (optind + 4 < argc) {
@@ -1395,37 +1434,62 @@ int main(int argc, char **argv)
 		}
 	}
 
+	memset(&o, 0, sizeof(o));
 	switch (output_fmt) {
 	case OUT_CNF:
+		o.init       = dimacs_cnf_init;
 		o.bit_out    = dimacs_cnf_bit_out;
 		o.constr_out = dimacs_cnf_constr_out;
+		o.fini       = dimacs_cnf_fini;
 		o.p          = &cnf;
+		o.f          = stdout;
 		break;
 	case OUT_DOT:
+	case OUT_DOT_EXT:
+		o.init       = dot_init;
 		o.bit_out    = dot_bit_out;
-		o.constr_out = dot_constr_out;
-		o.p          = stdout;
-		fprintf(o.p, "digraph G {\n");
+		o.constr_out = output_fmt == OUT_DOT ? dot_constr_out : dot_constr_out_ext;
+		o.fini       = dot_fini;
+		o.f          = stdout;
 		break;
 	}
 
 	switch (attack_mode) {
 	case ATTACK_PREIMAGE:
-		I = bits(&in, rate == 40 ? 3 * rate - 2 : rate - 16);
+		if (!i_n)
+			i_n = rate == 40 ? 3 * rate - 2 : rate - 16;
+		break;
+	case ATTACK_COLLISION:
+		if (!i_n)
+			i_n = rate == 40 ? 4 * rate - 2 : rate - 8;
+		if (!j_n)
+			j_n = rate == 40 ? 4 * rate - 3 : rate - 9;
+		break;
+	}
+
+	/* TODO? move this block to instance_run */
+	static char buf[128];
+	snprintf(buf, sizeof(buf),
+		"mode: %c, rate: %u, cap: %u, rounds: %u, I.n: %u, J.n: %u",
+		attack_mode, rate, cap, rounds, i_n, j_n);
+	ret = o.init(&o, buf); /* TODO: ret-val */
+	if (ret) {
+		fprintf(stderr, "error %d initializing output, aborting\n",
+			ret);
+		goto done;
+	}
+
+	switch (attack_mode) {
+	case ATTACK_PREIMAGE:
+		I = bits(&in, i_n);
 		O = bits(&in, 80);
 		ret = keccak_preimage(&in, I, O, &o);
 		break;
 	case ATTACK_COLLISION:
-		i_n = rate == 40 ? 4 * rate - 2 : rate - 8;
-		j_n = rate == 40 ? 4 * rate - 3 : rate - 9;
 		I = bits(&in, i_n);
 		J = bits(&in, j_n);
-		ret = keccak_collision(&in, I, J, &o);
+		ret = keccak_collision(&in, I, J, ceq, &o);
 		break;
-	}
-	if (output_fmt == OUT_DOT) {
-		fprintf(o.p, "}\n");
-		fclose(o.p);
 	}
 	if (ret)
 		goto done;
@@ -1469,10 +1533,11 @@ int main(int argc, char **argv)
 
 	/* mode of operation: CNF generation vs. solution compilation */
 	if (!sol) {
-		FILE *o = stdout;
-		fprintf(o, "c rate: %u, cap: %u, rounds: %u, I.n: %u, J.n: %u\n",
+		/*
+		fprintf(o.f, "c rate: %u, cap: %u, rounds: %u, I.n: %u, J.n: %u\n",
 			rate, cap, rounds, I.n, J.n);
-		dimacs_cnf_print(o, &cnf);
+		dimacs_cnf_print(o.f, &cnf);*/
+		o.fini(&o);
 	} else {
 		/* assuming minisat, which unfortunately got an output format
 		 * that differs from DIMACS */
@@ -1481,7 +1546,9 @@ int main(int argc, char **argv)
 		bb_t mem[(in.total_bits + bb_t_bits - 1) / bb_t_bits];
 
 		if (fscanf(sol, "%s\n", buf) < 1 || strncmp("SAT", buf, 3)) {
-			fprintf(stderr, "supplied file does not contain a solution: %s\n", buf);
+			fprintf(stderr,
+				"supplied file does not contain a solution: %s\n",
+				buf);
 			ret = EXIT_FAILURE;
 			goto done;
 		}
@@ -1510,6 +1577,8 @@ int main(int argc, char **argv)
 		}
 	}
 done:
+	if (o.f)
+		fclose(o.f);
 	if (sol)
 		fclose(sol);
 

@@ -112,18 +112,38 @@ static void dimacs_cnf_eq(struct dimacs_cnf *cnf, signed a, signed b)
 	dimacs_cnf_addn(cnf, -a,  b);
 }
 
-typedef int bit_out_f(void *p, enum op_t op, unsigned a, signed ta, signed tb);
-typedef int constr_out_f(void *p, unsigned n, const signed *l);
+struct out;
+
+typedef int init_f(const struct out *o, const char *comment);
+typedef int bit_out_f(const struct out *o, enum op_t op, unsigned a, signed ta, signed tb);
+typedef int constr_out_f(const struct out *o, unsigned n, const signed *l);
+typedef int fini_f(const struct out *o);
 
 struct out {
+	init_f *init;
 	bit_out_f *bit_out;
 	constr_out_f *constr_out;
+	fini_f *fini;
+
 	void *p;
+	FILE *f;
 };
 
-static int dimacs_cnf_constr_out(void *p, unsigned n, const signed *l)
+static int dimacs_cnf_init(const struct out *o, const char *comment)
 {
-	struct dimacs_cnf *cnf = p;
+	fprintf(o->f, "c %s\n", comment);
+	return 0;
+}
+
+static int dimacs_cnf_fini(const struct out *o)
+{
+	dimacs_cnf_print(o->f, o->p);
+	return 0;
+}
+
+static int dimacs_cnf_constr_out(const struct out *o, unsigned n, const signed *l)
+{
+	struct dimacs_cnf *cnf = o->p;
 	struct clause *c = malloc(offsetof(struct clause,l) + sizeof(signed)*n);
 	c->n = n;
 	memcpy(c->l, l, sizeof(signed)*n);
@@ -131,9 +151,9 @@ static int dimacs_cnf_constr_out(void *p, unsigned n, const signed *l)
 	return 0;
 }
 
-static int dimacs_cnf_bit_out(void *p, enum op_t op, unsigned a, signed ta, signed tb)
+static int dimacs_cnf_bit_out(const struct out *o, enum op_t op, unsigned a, signed ta, signed tb)
 {
-	struct dimacs_cnf *cnf = p;
+	struct dimacs_cnf *cnf = o->p;
 
 	switch (op) {
 	case AND:
