@@ -35,14 +35,14 @@ struct clause {
 	signed l[];
 };
 
-#define DIMACS_CNF_INIT	(struct dimacs_cnf){ 0, 0, NULL, 0 }
-struct dimacs_cnf {
+#define CNF_INIT	(struct cnf){ 0, 0, NULL, 0 }
+struct cnf {
 	unsigned v, c;
 	struct clause **cl;
 	unsigned cl_sz;
 };
 
-static void dimacs_cnf_print(FILE *f, const struct dimacs_cnf *cnf)
+static void dimacs_cnf_print(FILE *f, const struct cnf *cnf)
 {
 	unsigned i, j;
 	struct clause *c;
@@ -56,7 +56,7 @@ static void dimacs_cnf_print(FILE *f, const struct dimacs_cnf *cnf)
 	}
 }
 
-static void dimacs_cnf_add(struct dimacs_cnf *cnf, struct clause *c)
+static void cnf_add(struct cnf *cnf, struct clause *c)
 {
 	unsigned n = cnf->c;
 	unsigned i;
@@ -101,100 +101,86 @@ static struct clause * clause_create(unsigned n, ...)
 	return c;
 }
 
-#define dimacs_cnf_addn(cnf, ...)                         \
-	dimacs_cnf_add(cnf, clause_create(                \
+#define cnf_addn(cnf, ...)                                \
+	cnf_add(cnf, clause_create(                       \
 		ARRAY_SIZE(((signed []){ __VA_ARGS__ })), \
 		__VA_ARGS__))
 
-static void dimacs_cnf_eq(struct dimacs_cnf *cnf, signed a, signed b)
+static void cnf_eq(struct cnf *cnf, signed a, signed b)
 {
-	dimacs_cnf_addn(cnf,  a, -b);
-	dimacs_cnf_addn(cnf, -a,  b);
+	cnf_addn(cnf,  a, -b);
+	cnf_addn(cnf, -a,  b);
 }
 
-struct out;
-
-typedef int init_f(const struct out *o, const char *comment);
-typedef int bit_out_f(const struct out *o, enum op_t op, unsigned a, signed ta, signed tb);
-typedef int constr_out_f(const struct out *o, unsigned n, const signed *l);
-typedef int fini_f(const struct out *o);
-
-struct out {
-	init_f *init;
-	bit_out_f *bit_out;
-	constr_out_f *constr_out;
-	fini_f *fini;
-
-	void *p;
-	FILE *f;
-};
-
-static int dimacs_cnf_init(const struct out *o, const char *comment)
+static void cnf_clause_add(struct cnf *cnf, const signed *v, unsigned n)
 {
-	fprintf(o->f, "c %s\n", comment);
-	return 0;
-}
-
-static int dimacs_cnf_fini(const struct out *o)
-{
-	dimacs_cnf_print(o->f, o->p);
-	return 0;
-}
-
-static int dimacs_cnf_constr_out(const struct out *o, unsigned n, const signed *l)
-{
-	struct dimacs_cnf *cnf = o->p;
 	struct clause *c = malloc(offsetof(struct clause,l) + sizeof(signed)*n);
+	if (!c) {
+		perror("malloc");
+		exit(EXIT_FAILURE);
+	}
 	c->n = n;
-	memcpy(c->l, l, sizeof(signed)*n);
-	dimacs_cnf_add(cnf, c);
-	return 0;
+	memcpy(c->l, v, sizeof(signed)*n);
+	cnf_add(cnf, c);
 }
 
-static int dimacs_cnf_bit_out(const struct out *o, enum op_t op, unsigned a, signed ta, signed tb)
+static void cnf_read_dimacs(struct cnf *cnf, FILE *f)
 {
-	struct dimacs_cnf *cnf = o->p;
+	char *line = NULL;
+	size_t size = 0;
+	ssize_t len;
+	unsigned have_p = 0;
+	char *vline = NULL;
+	signed v;
+	signed *va = NULL;
+	unsigned va_n = 0;
+	unsigned va_sz = 0;
+	unsigned c_n, v_n;
+	int k;
 
-	switch (op) {
-	case AND:
-		/* express a = ax->a*ax->b */
-		dimacs_cnf_addn(cnf,  ta,      -a);
-		dimacs_cnf_addn(cnf,       tb, -a);
-		dimacs_cnf_addn(cnf, -ta, -tb,  a);
-		break;
-	case OR:
-		/* express a = ax->a+ax->b */
-		dimacs_cnf_addn(cnf, -ta,       a);
-		dimacs_cnf_addn(cnf,      -tb,  a);
-		dimacs_cnf_addn(cnf,  ta,  tb, -a);
-		break;
-	case XOR:
-		/* express a = ax->a^ax->b */
-		dimacs_cnf_addn(cnf, -ta,  tb,  a);
-		dimacs_cnf_addn(cnf, -ta, -tb, -a);
-		dimacs_cnf_addn(cnf,  ta,  tb, -a);
-		dimacs_cnf_addn(cnf,  ta, -tb,  a);
-		break;
-	case NOT:
-		/* express a = -ax->a */
-		dimacs_cnf_addn(cnf,  ta,  a);
-		dimacs_cnf_addn(cnf, -ta, -a);
-		// dimacs_cnf_eq(&cnf, a, -ax->a);
-		break;
-	case SET:
-		/* express a = ax->a */
-		dimacs_cnf_addn(cnf, -ta,  a);
-		dimacs_cnf_addn(cnf,  ta, -a);
-		// dimacs_cnf_eq(&cnf, a, ax->a);
-		break;
-	case VAR:
-		break;
-	default:
-		abort();
-		return 1;
+	while ((len = getline(&line, &size, f)) > 0) {
+		switch (line[0]) {
+		case 'c':
+			continue;
+		case 'p':
+			if (have_p) {
+				fprintf(stderr, "double 'p' line, aborting\n");
+				exit(EXIT_FAILURE);
+			}
+			if (sscanf(line + 1, "%s %u %u", line, &v_n, &c_n) < 3) {
+				fprintf(stderr, "invalid 'p' line, aborting\n");
+				exit(EXIT_FAILURE);
+			}
+			have_p = 1;
+			continue;
+		default:
+			break;
+		}
+		for (vline = line; sscanf(vline, "%d%n", &v, &k) >= 1; vline += k) {
+			if (v) {
+				darr_ensure(va, va_sz, va_n + 1);
+				va[va_n++] = v;
+			} else if (va_n) {
+				cnf_clause_add(cnf, va, va_n);
+				va_n = 0;
+			} else {
+				fprintf(stderr, "error: clause %u empty\n", cnf->c);
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
+	free(line);
+
+	if (va_n > 0) {
+		fprintf(stderr, "warning: last dimacs clause not finished by '0'\n");
+		cnf_clause_add(cnf, va, va_n);
 	}
 
-	return 0;
+	if (v_n != cnf->v || c_n != cnf->c)
+		fprintf(stderr,
+			"warning: #clauses/#variables (%u/%u) doesn't match "
+			"dimacs header (%u/%u)\n",
+			cnf->c, cnf->v, c_n, v_n);
 }
 
 #endif
