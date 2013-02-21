@@ -1564,6 +1564,9 @@ static void print_stats(FILE *f)
 }
 
 /* TODO: doesn't fail: ./ba -e 1600 c 240 160 2 */
+/* TODO: ./ba -e 400 c 240 160 2 @ f4ef4497a05d4e08a8449de6ecee6c85b0007996
+ * produced 12740 var, 25368 cl; minimized by minisat to 3540 var, 18744 cl,
+ * now: 22692 var, 46264 cl; minimized: 7054 var, 36768 cl */
 int main(int argc, char **argv)
 {
 	struct instance in = INSTANCE_INIT;
