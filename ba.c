@@ -378,7 +378,7 @@ static int exec_single(bb_t *mem, const struct operation *op, unsigned call_lvl)
 		break;
 	case CALL:
 		ret = _exec(mem, op->tgt, call_lvl+1);
-		goto done;
+		break;
 	case EXPECT:
 		for (i=0; i<in; i++, a += bb_t_bits, b += bb_t_bits, n -= bb_t_bits)
 			if (bb_get(mem, a, n) != bb_get(mem, b, n)) {
@@ -386,7 +386,7 @@ static int exec_single(bb_t *mem, const struct operation *op, unsigned call_lvl)
 				break;
 			}
 		if (ret) {
-			fprintf(stderr, "expect fail: %d\n", n, ret & 1);
+			fprintf(stderr, "expect fail: %d\n", ret & 1);
 			fprintf(stderr, "got     :");
 			for (i=0, a=op->a; i<(op->n+7)/8; i++, a += 8)
 				fprintf(stderr, " %02lx", bb_get(mem, a, 8));
@@ -396,27 +396,29 @@ static int exec_single(bb_t *mem, const struct operation *op, unsigned call_lvl)
 				fprintf(stderr, " %02lx", bb_get(mem, b, 8));
 			fprintf(stderr, "\n");
 		}
-		goto done;
+		break;
 	case EXPECT_ANY:
 		for (i=0; i<in; i++, a += bb_t_bits, n -= bb_t_bits)
 			tmp[0] |= bb_get(mem, a, n);
 		if (!tmp[0])
 			fprintf(stderr, "expect_any fail\n");
 		ret = 1;
-		goto done;
+		break;
 	}
 
+	if (op_flags[op->op].mem_r) {
 #if 1
-	bb_cpy(mem, op->r, tmp, 0, op->n);
+		bb_cpy(mem, r, tmp, 0, op->n);
 #elif 1
-	n = op->n;
-	for (i=0; i<in; i++, r += bb_t_bits, n -= bb_t_bits)
-		bb_put(mem, tmp[i], r, n);
+		n = op->n;
+		for (i=0; i<in; i++, r += bb_t_bits, n -= bb_t_bits)
+			bb_put(mem, tmp[i], r, n);
 #else
-	bb_clear(mem, op->r, op->n);
-	bb_op(mem, r, tmp, 0, op->n, OR);
+		bb_clear(mem, op->r, op->n);
+		bb_op(mem, r, tmp, 0, op->n, OR);
 #endif
-done:
+	}
+
 	return ret;
 }
 
@@ -1911,7 +1913,7 @@ static void usage(const char *progname)
 		"  -c    DIMACS CNF output format [default]\n"
 		"  -d    dot(1) output format instead of DIMACS CNF\n"
 		"  -D    dot(1) output format with additional nodes\n"
-		"  -e    execute instead of formula generation, input via stdin\n"
+		"  -e    execution instead of formula generation, input via stdin\n"
 		"  -F    disable constant folding\n"
 		"  -h    show this help message\n"
 		"  -I N  set variable size in bits of (first, for 'c') input\n"
@@ -2180,10 +2182,6 @@ int main(int argc, char **argv)
 
 	/* mode of operation: CNF generation vs. solution compilation */
 	if (!sol) {
-		/*
-		fprintf(o.f, "c rate: %u, cap: %u, rounds: %u, I.n: %u, J.n: %u\n",
-			rate, cap, rounds, I.n, J.n);
-		dimacs_cnf_print(o.f, &cnf);*/
 		if (execute) {
 			/* TODO: output */
 		} else {
