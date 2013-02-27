@@ -36,8 +36,8 @@ struct operation {
 		SET,        /* n,r,a */
 		SET0,       /* n,r */
 		LOAD,       /* n,r,a,v */
-		ADD,        /* n,r,a,b */
-#define OP_NUM	(ADD + 1)
+		// ADD,        /* n,r,a,b */
+#define OP_NUM	(LOAD + 1)
 	} op;
 	unsigned n, r, a, b;
 	struct operation *tgt;
@@ -97,7 +97,7 @@ static void op_list_free_deep(struct operation *o)
 
 static const char *op_names[] = {
 	"and", "or", "xor", "not", "rol", "call", "expect", "expect_any",
-	"var", "set", "set0", "load", "add"
+	"var", "set", "set0", "load"/*, "add"*/
 };
 
 static struct op_flags {
@@ -117,8 +117,20 @@ static struct op_flags {
 	[SET]        = { 1, 1, 0 },
 	[SET0]       = { 1, 0, 0 },
 	[LOAD]       = { 1, 0, 0 }, /* a valid but offset, no mem ptr */
-	[ADD]        = { 1, 1, 1 },
+	// [ADD]        = { 1, 1, 1 },
 };
+
+#define PRI_BUFSZ	256
+
+static const char * opstr(const struct operation *op)
+{
+	static char buf[PRI_BUFSZ];
+
+	snprintf(buf, sizeof(buf), "%s[n:%u,r:%u,a:%u,b:%u]",
+		op_names[op->op], op->n, op->r, op->a, op->b);
+
+	return buf;
+}
 
 #define OP_AND(out,b0,b1) (struct operation){ AND, (out).n, (out).o, (b0).o, (b1).o }
 #define OP_OR(out,b0,b1)  (struct operation){ OR , (out).n, (out).o, (b0).o, (b1).o }
@@ -132,8 +144,7 @@ static struct op_flags {
 #define OP_SET(out,src)   (struct operation){ SET, (out).n, (out).o, (src).o }
 #define OP_SET0(out)      (struct operation){ SET0, (out).n, (out).o }
 #define OP_LOAD(out,off,bb) (struct operation){ LOAD, (out).n, (out).o, (off), .v = (bb) }
-#define OP_ADD(out,b0,b1) (struct operation){ ADD, (out).n, (out).o, (b0).o, (b1).o }
-
+// #define OP_ADD(out,b0,b1) (struct operation){ ADD, (out).n, (out).o, (b0).o, (b1).o }
 
 #if 0
 static void bb_clear(bb_t *mem, unsigned o, unsigned n)
@@ -194,30 +205,97 @@ static void bb_op(bb_t *mem, unsigned to, const bb_t *src, unsigned so, unsigned
 }
 #endif
 
+#if 0
 static bb_t bb_get(const bb_t *mem, unsigned o, unsigned n)
 {
 	unsigned shl = o & (bb_t_bits - 1);
 	unsigned shr = bb_t_bits - shl;
 	unsigned so = o / bb_t_bits;
+	if (n > bb_t_bits)
+		n = bb_t_bits;
 	bb_t r0 = mem[so];
 	bb_t r1 = n + shl > bb_t_bits ? mem[so+1] : 0;
 	return (r0 >> shl | r1 << shr) & (bb_t_mask >> (bb_t_bits - n));
 }
-
+#elif 0
+static bb_t bb_get(const bb_t *mem, unsigned o, unsigned n)
+{
+	unsigned shl = o & (bb_t_bits - 1);
+	unsigned shr = bb_t_bits - shl;
+	unsigned so = o / bb_t_bits;
+	bb_t r = 0;
+	if (n > bb_t_bits)
+		n = bb_t_bits;
+	if (n)
+		r |= mem[so] >> shl; /* min(n,shr) valid bits */
+	if (n > shr)
+		r |= mem[so+1] << shr;
+	return r & (n ? bb_t_mask >> (bb_t_bits - n) : 0);
+}
+#else
+static bb_t bb_get(const bb_t *mem, unsigned o, unsigned n)
+{
+	bb_t r = 0;
+	unsigned i;
+	if (n > bb_t_bits)
+		n = bb_t_bits;
+	for (i=0; i<n; i++) {
+		r |= ((mem[o/bb_t_bits] >> (o & (bb_t_bits-1))) & (bb_t)1) << i;
+		o++;
+	}
+	return r;
+}
+#endif
+#if 0
 static void bb_put(bb_t *mem, bb_t v, unsigned o, unsigned n)
 {
 	unsigned shl = o & (bb_t_bits - 1);
 	unsigned shr = bb_t_bits - shl;
 	unsigned so = o / bb_t_bits;
+	if (n > bb_t_bits)
+		n = bb_t_bits;
 	if (n < bb_t_bits)
 		v &= bb_t_mask >> (bb_t_bits - n);
-	mem[so]   = (mem[so  ] & (bb_t_mask >> shr)) | v << shl;
+	mem[so] = (mem[so] & (bb_t_mask >> shr)) | v << shl;
 	if (n + shl > bb_t_bits)
 		mem[so+1] = (mem[so+1] & (bb_t_mask << shl)) | v >> shr;
 }
+#elif 0
+static void bb_put(bb_t *mem, bb_t v, unsigned o, unsigned n)
+{
+	unsigned shl = o & (bb_t_bits - 1);
+	unsigned shr = bb_t_bits - shl;
+	unsigned so = o / bb_t_bits;
+	if (!n)
+		return;
+	if (n > bb_t_bits)
+		n = bb_t_bits;
+	if (n < bb_t_bits)
+		v &= bb_t_mask >> (bb_t_bits - n);
+	if (n > shr) {
+		mem[so]   = (mem[so  ] & (bb_t_mask >> shr)) | v << shl;
+		mem[so+1] = (mem[so+1] & (bb_t_mask << shl)) | v >> shr;
+	} else {
+		mem[so] = (mem[so] & (bb_t_mask >> shr | bb_t_mask << (shl + n))) | v << shl;
+	}
+}
+#else
+static void bb_put(bb_t *mem, bb_t v, unsigned o, unsigned n)
+{
+	if (n > bb_t_bits)
+		n = bb_t_bits;
+	while (n) {
+		mem[o/bb_t_bits] &= ~((bb_t)1 << (o & (bb_t_bits - 1)));
+		mem[o/bb_t_bits] |= (v & 1) << (o & (bb_t_bits - 1));
+		o++;
+		n--;
+		v >>= 1;
+	}
+}
+#endif
 
-#if 0
-static void bb_cpy(bb_t *mem, unsigned to, const bb_t *src, unsigned so, unsigned n)
+#if 1
+static void bb_cpy(bb_t *restrict mem, unsigned to, const bb_t *restrict src, unsigned so, unsigned n)
 {
 	while (n) {
 		unsigned n0 = n > bb_t_bits ? bb_t_bits : n;
@@ -236,7 +314,9 @@ static void bits_set(bb_t *mem, bb_t v, const struct bits *b)
 			b->n - i < bb_t_bits ? b->n - i : bb_t_bits);
 }
 
-static int exec(bb_t *mem, const struct operation *op)
+static int _exec(bb_t *mem, const struct operation *op, unsigned call_lvl);
+
+static int exec_single(bb_t *mem, const struct operation *op, unsigned call_lvl)
 {
 	bb_t tmp[(op->n + 2*bb_t_bits - 1) / bb_t_bits];
 	unsigned i;
@@ -244,7 +324,20 @@ static int exec(bb_t *mem, const struct operation *op)
 	unsigned r = op->r, a = op->a, b = op->b, n = op->n;
 	int ret = 0;
 
-	memset(tmp, 0, sizeof(tmp));
+	// memset(tmp, 0, sizeof(tmp));
+
+	fprintf(stderr, "exec: %*s%s", call_lvl, "", opstr(op));
+	if (op_flags[op->op].mem_a) {
+		fprintf(stderr, ", a:");
+		for (i=0; i<(n+7)/8; i++)
+			fprintf(stderr, " %02lx", bb_get(mem, a + i*8, 8));
+	}
+	if (op_flags[op->op].mem_b) {
+		fprintf(stderr, ", b:");
+		for (i=0; i<(n+7)/8; i++)
+			fprintf(stderr, " %02lx", bb_get(mem, b + i*8, 8));
+	}
+	fprintf(stderr, "\n");
 
 	switch (op->op) {
 	case AND:
@@ -260,7 +353,7 @@ static int exec(bb_t *mem, const struct operation *op)
 			tmp[i] = bb_get(mem, a, n) ^ bb_get(mem, b, n);
 		break;
 	case NOT:
-		for (i=0; i<in; i++, a += bb_t_bits, b += bb_t_bits, n -= bb_t_bits)
+		for (i=0; i<in; i++, a += bb_t_bits, n -= bb_t_bits)
 			tmp[i] = ~bb_get(mem, a, n);
 		break;
 	case ROL:
@@ -268,10 +361,23 @@ static int exec(bb_t *mem, const struct operation *op)
 		bb_cpy(tmp, 0, mem, a + n - b, b);
 		bb_cpy(tmp, b, mem, a        , n - b);
 		break;
+	case SET:
+		bb_cpy(tmp, 0, mem, a, n);
+		break;
+	case SET0:
+		memset(tmp, 0, sizeof(tmp));
+		break;
+	case LOAD:
+		bb_cpy(tmp, 0, op->v, a, n);
+		break;
+	case VAR:
+		memset(tmp, 0, sizeof(tmp));
+		fprintf(stderr, "VAR in exec(): expecting %u bytes / %u bits\n", (n + 7) / 8, n);
+		ret = !fread(tmp, (n + 7) / 8, 1, stdin);
+		fprintf(stderr, "VAR in exec(): ret: %d\n", ret);
+		break;
 	case CALL:
-		for (i=0; i<n; i++)
-			if ((ret = exec(mem, op->tgt + i)) != 0)
-				break;
+		ret = _exec(mem, op->tgt, call_lvl+1);
 		goto done;
 	case EXPECT:
 		for (i=0; i<in; i++, a += bb_t_bits, b += bb_t_bits, n -= bb_t_bits)
@@ -279,12 +385,30 @@ static int exec(bb_t *mem, const struct operation *op)
 				ret = i << 1 | 1;
 				break;
 			}
-		printf("expect fail: %d\n", ret & 1);
-		ret = 0;
+		if (ret) {
+			fprintf(stderr, "expect fail: %d\n", n, ret & 1);
+			fprintf(stderr, "got     :");
+			for (i=0, a=op->a; i<(op->n+7)/8; i++, a += 8)
+				fprintf(stderr, " %02lx", bb_get(mem, a, 8));
+			fprintf(stderr, "\n");
+			fprintf(stderr, "expected:");
+			for (i=0, b=op->b; i<(op->n+7)/8; i++, b += 8)
+				fprintf(stderr, " %02lx", bb_get(mem, b, 8));
+			fprintf(stderr, "\n");
+		}
+		goto done;
+	case EXPECT_ANY:
+		for (i=0; i<in; i++, a += bb_t_bits, n -= bb_t_bits)
+			tmp[0] |= bb_get(mem, a, n);
+		if (!tmp[0])
+			fprintf(stderr, "expect_any fail\n");
+		ret = 1;
 		goto done;
 	}
 
 #if 1
+	bb_cpy(mem, op->r, tmp, 0, op->n);
+#elif 1
 	n = op->n;
 	for (i=0; i<in; i++, r += bb_t_bits, n -= bb_t_bits)
 		bb_put(mem, tmp[i], r, n);
@@ -295,19 +419,27 @@ static int exec(bb_t *mem, const struct operation *op)
 done:
 	return ret;
 }
-#endif
 
-#define PRI_BUFSZ	256
-
-static const char * opstr(const struct operation *op)
+static int _exec(bb_t *mem, const struct operation *op, unsigned call_lvl)
 {
-	static char buf[PRI_BUFSZ];
+	unsigned i;
+	int r = 0;
 
-	snprintf(buf, sizeof(buf), "%s[n:%u,r:%u,a:%u,b:%u]",
-		op_names[op->op], op->n, op->r, op->a, op->b);
+	for (i=0; op; i++, op = op->next)
+		if ((r = exec_single(mem, op, call_lvl)) != 0) {
+			fprintf(stderr, "call stack %u: op %p: %s\n",
+				i, (void *)op, opstr(op));
+			break;
+		}
 
-	return buf;
+	return r;
 }
+
+static int exec(bb_t *mem, const struct operation *op)
+{
+	return _exec(mem, op, 0);
+}
+#endif
 
 #include "common.h"
 
@@ -330,7 +462,7 @@ struct out {
 
 struct bitxform {
 	enum op_t op; /* subset: AND, OR, XOR, NOT, SET, VAR */
-	unsigned a, b; /* for op=VAR, variable=1: a = memory bit address (op->r+i) */ 
+	unsigned a, b; /* for op=VAR, variable=1: a = memory bit address (op->r+i) */
 	unsigned resolved : 1;
 	unsigned variable : 1;
 	unsigned referees_n;
@@ -796,6 +928,12 @@ static int opx_exec_single(struct opxform *x, const struct operation *op, const 
 				x->xf[k+i].b = x->mem2xf[op->b + i];
 		}
 		break;
+	// case ADD:
+		/* SET0 C0
+		 * for (i=0; i<n; i++) {
+		 *   SET Ri, (Ai*Bi ^ Ci)
+		 *   SET C(i+1), (Ai*Bi + Ai*Ci + Bi*Ci)
+		 * } */
 	case ROL:
 		b = op->b % n;
 		for (i=0; i<n; i++) {
@@ -914,11 +1052,6 @@ static void print_bits(const char *name, const struct bits *b)
 	fprintf(stderr, "%s[n:%u,o:%u] -- [%u,%u)\n", name,
 		b->n, b->o, b->o, b->o + b->n);
 }
-
-struct instance {
-	unsigned total_bits;
-	struct opxform *x;
-};
 
 static int cnf_init(const struct out *o, const char *comment)
 {
@@ -1053,6 +1186,12 @@ static int dot_constr_out_ext(const struct out *o, unsigned n, const signed *l)
 
 #define INSTANCE_INIT	(struct instance){ 0, NULL }
 
+struct instance {
+	unsigned total_bits;
+	struct opxform *x;
+	struct bits C, D, E; /* carry for addition */
+};
+
 static int instance_run(
 	struct instance *in, const struct operation *op, const struct out *o
 ) {
@@ -1068,17 +1207,300 @@ struct bits bits(struct instance *in, unsigned n)
 	return r;
 }
 
-struct keccak {
-	unsigned w, r, c, rounds;
-	struct bits RC;
-	struct bits S, B, C, D, t, b;
-	struct operation *absorb, *f, *round, *squeeze;
-};
+static struct operation * op_add(const struct instance *in, unsigned n, unsigned r, unsigned a, unsigned b)
+{
+	struct operation *f = NULL, **tail = &f;
+	unsigned c = in->C.o;
+	unsigned d = in->D.o;
+	unsigned e = in->E.o;
+	unsigned i;
+
+	op_app(&(struct operation){ SET0, 1, c }, &tail);
+	for (i=0; i<n; i++) {
+		struct operation op[] = {
+#if 0
+			{ XOR, 1, r+i, a+i, b+i }, /* 4x3 cl */
+			{ AND, 1, d  , r+i, c },   /* 1x3+2x2 cl */
+			{ XOR, 1, r+i, r+i, c },   /* 4x3 cl */
+			{ AND, 1, c  , a+i, b+i }, /* 1x3+2x2 cl */
+			{ OR , 1, c  , c  , d },   /* 1x3+2x2 cl */
+			                           /* -> 11x3+6x2 cl */
+#else
+#if 0
+			{ XOR, 1, r+i, a+i, b+i }, /* 4x3 cl */
+			{ XOR, 1, r+i, r+i, c },   /* 4x3 cl */
+#elif 1
+			{ XOR, 1, r+i, a+i, b+i },
+			{ NOT, 1, d  , c },
+			{ AND, 1, d  , d  , r+i },
+			{ NOT, 1, e  , r+i },
+			{ AND, 1, e  , c  , e },
+			{ OR,  1, r+i, e  , d },
+#else
+			{ NOT, 1, d  , a+i },
+			{ NOT, 1, e  , b+i },
+			{ AND, 1, d  , d  , e },
+			{ AND, 1, e  , a+i, b+i },
+			{ OR , 1, r+i, d  , e },
+			{ AND, 1, r+i, r+i, c },
+			{ NOT, 1, d  , b+i },
+			{ AND, 1, d  , a+i, d },
+			{ NOT, 1, e  , a+i },
+			{ AND, 1, e  , e  , b+i },
+			{ OR , 1, d  , d  , e },
+			{ NOT, 1, e  , c },
+			{ AND, 1, d  , d  , e },
+			{ OR , 1, r+i, r+i, d },
+#endif
+			{ OR , 1, d  , a+i, b+i }, /* 1x3+2x2 cl */
+			{ AND, 1, c  , c  , d },   /* 1x3+2x2 cl */
+			{ AND, 1, d  , a+i, b+i }, /* 1x3+2x2 cl */
+			{ OR , 1, c  , c  , d },   /* 1x3+2x2 cl */
+			                           /* -> 12x3+8x2 cl */
+#endif
+		};
+		op_arr2list(ARRAY_SIZE(op), op, &tail);
+	}
+	return f;
+}
+
+#define OPS(...)		(struct operation[]){ __VA_ARGS__ }
+#define OP_LIST(arr,tail)	op_arr2list(ARRAY_SIZE((arr)),(arr),(tail))
+
+static struct operation * md5_chunk(
+	struct instance *in,
+	/* each n=32 */
+	struct bits W[static 16], struct bits K[static 64], struct bits H[static 4]
+) {
+	struct bits a, b, c, d;
+	struct bits f, t0, t1, temp;
+
+	struct operation *ret = NULL, **tail = &ret;
+	unsigned i;
+
+	static const unsigned r[] = {
+		7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+		5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+		4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+		6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+	};
+
+	a = bits(in, 32);
+	b = bits(in, 32);
+	c = bits(in, 32);
+	d = bits(in, 32);
+	f = bits(in, 32);
+	t0 = bits(in, 32);
+	t1 = bits(in, 32);
+	temp = bits(in, 32);
+
+	op_app(&OP_SET(a, H[0]), &tail);
+	op_app(&OP_SET(b, H[1]), &tail);
+	op_app(&OP_SET(c, H[2]), &tail);
+	op_app(&OP_SET(d, H[3]), &tail);
+
+	struct operation i0[] = {
+		OP_AND(t0,b,c),
+		OP_NOT(t1,b),
+		OP_AND(t1,t1,d),
+		OP_OR(f,t0,t1),
+	}, i1[] = {
+		OP_AND(t0,d,b),
+		OP_NOT(t1,d),
+		OP_AND(t1,t1,c),
+		OP_OR(f,t0,t1),
+	}, i2[] = {
+		OP_XOR(t0,b,c),
+		OP_XOR(f,t0,d),
+	}, i3[] = {
+		OP_NOT(t0,d),
+		OP_OR(t0,b,t0),
+		OP_XOR(f,c,t0),
+	};
+	struct operation *C[] = {
+		op_arr2list(ARRAY_SIZE(i0), i0, NULL),
+		op_arr2list(ARRAY_SIZE(i1), i1, NULL),
+		op_arr2list(ARRAY_SIZE(i2), i2, NULL),
+		op_arr2list(ARRAY_SIZE(i3), i3, NULL),
+	};
+
+	for (i=0; i<64; i++) {
+		unsigned g;
+		if (i < 16) {
+			op_app(&OP_CALL(C[0]), &tail);
+			g = i;
+		} else if (i < 32) {
+			op_app(&OP_CALL(C[1]), &tail);
+			g = (5*i + 1) % 16;
+		} else if (i < 48) {
+			op_app(&OP_CALL(C[2]), &tail);
+			g = (3*i + 5) % 16;
+		} else {
+			op_app(&OP_CALL(C[3]), &tail);
+			g = (7*i) % 16;
+		}
+		op_app(&OP_SET(temp,d), &tail);
+		op_app(&OP_SET(d,c), &tail);
+		op_app(&OP_SET(c,b), &tail);
+		op_app(&OP_CALL(op_add(in,32,t0.o,a.o,f.o)), &tail);
+		op_app(&OP_CALL(op_add(in,32,t1.o,K[i].o,W[g].o)), &tail);
+		op_app(&OP_CALL(op_add(in,32,t0.o,t0.o,t1.o)), &tail);
+		op_app(&OP_ROL(t0,t0,r[i]), &tail);
+		op_app(&OP_CALL(op_add(in,32,b.o,b.o,t0.o)), &tail);
+		op_app(&OP_SET(a,temp), &tail);
+	}
+
+	op_app(&OP_CALL(op_add(in,32,H[0].o,H[0].o,a.o)), &tail);
+	op_app(&OP_CALL(op_add(in,32,H[1].o,H[1].o,b.o)), &tail);
+	op_app(&OP_CALL(op_add(in,32,H[2].o,H[2].o,c.o)), &tail);
+	op_app(&OP_CALL(op_add(in,32,H[3].o,H[3].o,d.o)), &tail);
+
+	return ret;
+}
 
 struct input {
 	struct bits I;
 	struct bits max_bit; /* unused iff !vlen */
 	unsigned vlen : 1;
+};
+
+#define div_ceil(p,q)	(((p)+(q)-1)/(q))
+
+struct md5 {
+	union {
+		uint64_t k;
+		bb_t b[div_ceil(sizeof(uint64_t),sizeof(bb_t))];
+	} len;
+	struct bits H[4];
+};
+
+union bbu {
+	const uint8_t *u8;
+	const uint32_t *u32;
+	const uint64_t *u64;
+	const bb_t *b;
+};
+
+static struct operation * md5_init(
+	struct md5 *alg, struct instance *in,
+	struct input *I
+) {
+static const uint32_t k[] = {
+	0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+	0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+	0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+	0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+	0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+	0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+	0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+	0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+	0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+	0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+	0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+	0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+	0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+	0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+	0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+	0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+}, h[] = {
+	0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
+};
+	struct bits W[16], K[64];
+	struct operation *f = NULL, **tail = &f;
+	struct operation *chunk;
+	unsigned i, j;
+
+	for (i=0; i<ARRAY_SIZE(W); i++)
+		W[i] = bits(in, 32);
+	for (i=0; i<ARRAY_SIZE(K); i++) {
+		K[i] = bits(in, 32);
+		op_app(&OP_LOAD(K[i], 32 * i, (union bbu){ .u32 = k }.b), &tail);
+	}
+	for (i=0; i<ARRAY_SIZE(alg->H); i++) {
+		alg->H[i] = bits(in, 32);
+		op_app(&OP_LOAD(alg->H[i], 32 * i, (union bbu){ .u32 = h }.b), &tail);
+	}
+
+	chunk = md5_chunk(in, W, K, alg->H);
+
+	unsigned n = I->I.n, o = I->I.o;
+	unsigned loops = div_ceil(n + 1 + 64, 512);
+	alg->len.k = n;
+	for (i=0; i<loops-1; i++, n-=512) {
+		for (j=0; j<ARRAY_SIZE(W); j++, o+=32)
+			op_app(&(struct operation){ SET, 32, W[j].o, o }, &tail);
+		op_app(&OP_CALL(chunk), &tail);
+	}
+
+	for (j=0; j<ARRAY_SIZE(W); j++)
+		op_app(&OP_SET0(W[j]), &tail);
+
+	for (j=0; n>=32; j++, n-=32, o+=32)
+		op_app(&(struct operation){ SET, 32, W[j].o, o }, &tail);
+	if (n)
+		op_app(&(struct operation){ SET, n, W[j].o, o }, &tail);
+	op_app(&(struct operation){ NOT, 1, W[j].o+n, W[j].o+n }, &tail);
+	op_app(&OP_LOAD(W[14],  0, alg->len.b), &tail);
+	op_app(&OP_LOAD(W[15], 32, alg->len.b), &tail);
+
+	op_app(&OP_CALL(chunk), &tail);
+
+	return f;
+}
+
+static void md5(void)
+{
+	struct instance in = INSTANCE_INIT;
+	struct md5 md5;
+	struct input I;
+	struct cnf cnf = CNF_INIT;
+	struct out o;
+	unsigned i;
+	struct bits O[4];
+
+	memset(&md5, 0, sizeof(md5));
+	I.I = bits(&in, 8);
+
+	o.init       = cnf_init;
+	o.bit_out    = cnf_bit_out;
+	o.constr_out = cnf_constr_out;
+	o.fini       = cnf_fini;
+	o.p          = &cnf;
+	o.f          = stdout;
+ 
+	in.C = bits(&in, 1);
+	in.D = bits(&in, 1);
+	in.E = bits(&in, 1);
+
+	struct operation *f = md5_init(&md5, &in, &I);
+	struct operation *g = NULL, **tail = &g;
+
+static const uint32_t preimage[] = { /* data\n */
+	// 0x6137cde4, 0x893c59f7, 0x6f005a81, 0x23d8e8e6
+	//0xe4cd3761, 0xf7593c89, 0x815a006f, 0xe6e8d823
+	0xd98c1dd4, 0x04b2008f, 0x890980e9, 0x7e42f8ec
+};
+	op_app(&OP_VAR(I.I), &tail);
+	op_app(&OP_CALL(f), &tail);
+
+	for (i=0; i<4; i++) {
+		O[i] = bits(&in, 32);
+		op_app(&OP_LOAD(O[i],32*i,(union bbu){ .u32 = preimage }.b), &tail);
+		op_app(&OP_EXPECT(md5.H[i],O[i]), &tail);
+	}
+
+	o.init(&o, "yeah, md5...");
+
+	instance_run(&in, g, &o);
+
+	o.fini(&o);
+}
+
+struct keccak {
+	unsigned w, r, c, rounds;
+	struct bits RC;
+	struct bits S, B, C, D, t, b;
+	struct operation *absorb, *f, *round, *squeeze;
 };
 
 static void keccak_init(
@@ -1115,7 +1537,7 @@ static struct operation * keccak_f(
 	const struct keccak *kc,
 	const struct operation *call_round
 ) {
-	static const bb_t keccak_RC[24] = {
+	static const uint64_t keccak_RC[24] = {
 		[ 0] = 0x0000000000000001,
 		[ 1] = 0x0000000000008082,
 		[ 2] = 0x800000000000808A,
@@ -1146,14 +1568,14 @@ static struct operation * keccak_f(
 	unsigned i;
 
 	for (i=0; i<kc->rounds; i++) {
-		op_app(&OP_LOAD(kc->RC, i * bb_t_bits, keccak_RC), &tail);
+		op_app(&OP_LOAD(kc->RC, i * bb_t_bits, (union bbu){ .u64 = keccak_RC }.b), &tail);
 		op_app(call_round, &tail);
 	}
 
 	return op_dup(&OP_CALL(f));
 }
 
-struct operation * keccak_round(const struct keccak *kc, struct instance *in)
+static struct operation * keccak_round(const struct keccak *kc, struct instance *in)
 {
 	static const unsigned rotation_offsets[5][5] = {
 		{  0,  1, 62, 28, 27 },
@@ -1316,7 +1738,7 @@ static void keccak_init_full(
 
 union bc {
 	unsigned char c[10];
-	bb_t b[2];
+	bb_t b[(10+sizeof(bb_t)-1)/sizeof(bb_t)];
 };
 
 static const union bc out_r40[] = {
@@ -1381,14 +1803,17 @@ static const union bc out_r1440[] = {
  *   - SET, NOT, VAR, EXPECT?
  * - modify keccak_output to apply EXPECT directly instead of SET'ing O */
 
-static int keccak_preimage(
+/* TODO: keccak_{f,rounds,input,output} shall not return op_dup(&OP_CALL(f))
+ * or use *call_keccak_f but use OP_CALL(keccak_f) */ 
+
+static struct operation * keccak_preimage(
 	struct instance *in,
 	struct input *I,
 	struct bits O,
 	const struct out *o
 ) {
 	struct keccak kc;
-	const union bc *out_r;
+	const union bc *out_r; /* TODO: union bbu */
 
 	/* TODO: move upwards, main() or so */
 	assert(0 < rounds);
@@ -1419,14 +1844,10 @@ static int keccak_preimage(
 		OP_EXPECT(P,O),
 	};
 
-	struct operation *r = op_arr2list(ARRAY_SIZE(ops), ops, NULL);
-
-	int ret = instance_run(in, r, o);
-	op_list_free_deep(r);
-	return ret;
+	return op_arr2list(ARRAY_SIZE(ops), ops, NULL);
 }
 
-static int keccak_collision(
+static struct operation * keccak_collision(
 	struct instance *in,
 	struct input *I, struct input *J,
 	unsigned state_bits_equal,
@@ -1444,10 +1865,6 @@ static int keccak_collision(
 	struct operation coll[] = {
 		OP_VAR(I->I),
 		OP_VAR(J->I),
-
-		/* TODO: instead of the below: EXPECT_ANY on kc0.S[0:r-1) in the
-		 * last absorb round
-		 * (w/o -[ij]: use % rate to determine variable length part) */
 
 		OP_SET0(kc0.S),
 		OP_SET0(kc1.S),
@@ -1482,27 +1899,36 @@ static int keccak_collision(
 		op_arr2list(ARRAY_SIZE(I_neq_J), I_neq_J, &tail);
 	}
 
-	int ret = instance_run(in, r, o);
-	op_list_free_deep(r);
-	return ret;
+	return r;
 }
 
 static void usage(const char *progname)
 {
-	fprintf(stderr, "usage: %s [-OPTS] {p|c} RATE CAP ROUNDS [SOLUTION]\n",
+	fprintf(stderr,
+		"usage: %s [-OPTS] {p|c} RATE CAP ROUNDS [SOLUTION]\n",
 		progname);
 	fprintf(stderr, "\n"
-			"  -c    DIMACS CNF output format [default]\n"
-			"  -d    dot(1) output format instead of DIMACS CNF\n"
-			"  -D    dot(1) output format with additional nodes\n"
-			"  -e N  number of equal bits in state desired for collision mode [160]\n"
-			"  -F    disable constant folding\n"
-			"  -h    show this help message\n"
-			/* TODO: -I, -J */
-			"  -i N  set size in bits of (first, for 'c') input\n"
-			"  -j N  set size in bits of second ('c') input\n"
-			"  -u    ensure unequality of the two collision inputs\n"
+		"  -c    DIMACS CNF output format [default]\n"
+		"  -d    dot(1) output format instead of DIMACS CNF\n"
+		"  -D    dot(1) output format with additional nodes\n"
+		"  -e    execute instead of formula generation, input via stdin\n"
+		"  -F    disable constant folding\n"
+		"  -h    show this help message\n"
+		"  -I N  set variable size in bits of (first, for 'c') input\n"
+		"  -i N  set size in bits of (first, for 'c') input\n"
+		"  -J N  set variable size in bits of second ('c') input\n"
+		"  -j N  set size in bits of second ('c') input\n"
+		"  -s N  number of equal bits in state desired for collision mode [160]\n"
+		"  -u    ensure unequality of the two collision inputs\n"
 	);
+	fprintf(stderr, "\n\
+Variable size input: Enables variable size for the last round. The input length\n\
+for the algorithm is determined solely by adding a trailing '1' bit in the last\n\
+round, so by ensuring that at least one bit in the range regular input length+1\n\
+is set, varying lengths are supported by adding only one (large) clause.\n\
+For N bit varyable size input and rate R, the resulting input lengths are in the\n\
+interval [M,M+k] for M=ceil((N+2)/R-1)*R, k=N%%R. The added clause contains k+1\n\
+positive literals. In this mode, N%%R must not equal R-1.\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -1563,15 +1989,23 @@ static void print_stats(FILE *f)
 		}
 }
 
+int _main()
+{
+	md5();
+	return 0;
+}
+
 /* TODO: doesn't fail: ./ba -e 1600 c 240 160 2 */
 /* TODO: ./ba -e 400 c 240 160 2 @ f4ef4497a05d4e08a8449de6ecee6c85b0007996
  * produced 12740 var, 25368 cl; minimized by minisat to 3540 var, 18744 cl,
- * now: 22692 var, 46264 cl; minimized: 7054 var, 36768 cl */
+ * now: 22692 var, 46264 cl; minimized: 7054 var, 36768 cl
+ * -> meaning of ceq changed: not kc?.S EXPECT'ed but output of keccak */
 int main(int argc, char **argv)
 {
 	struct instance in = INSTANCE_INIT;
 	struct cnf cnf = CNF_INIT;
 	struct out o;
+	struct operation *op;
 	int ret = EXIT_SUCCESS;
 	FILE *sol = NULL;
 	int opt;
@@ -1585,6 +2019,8 @@ int main(int argc, char **argv)
 		ATTACK_COLLISION = 'c',
 	} attack_mode;
 
+	unsigned execute = 0;
+
 	signed i_n = 0, j_n = 0, ceq = 160;
 
 	struct bits O;
@@ -1593,7 +2029,7 @@ int main(int argc, char **argv)
 	memset(&I, 0, sizeof(I));
 	memset(&J, 0, sizeof(J));
 
-	while ((opt = getopt(argc, argv, ":cdDe:FhI:i:J:j:u")) != -1) {
+	while ((opt = getopt(argc, argv, ":cdDeFhI:i:J:j:s:u")) != -1) {
 		switch (opt) {
 		case 'c':
 		case 'd':
@@ -1601,10 +2037,7 @@ int main(int argc, char **argv)
 			output_fmt = opt;
 			break;
 		case 'e':
-			if ((ceq = atoi(optarg)) < 0) {
-				fprintf(stderr, "-%c needs an argument >= 0\n", opt);
-				exit(EXIT_FAILURE);
-			}
+			execute = 1;
 			break;
 		case 'F':
 			constant_folding = 0;
@@ -1624,6 +2057,12 @@ int main(int argc, char **argv)
 			J.vlen = (opt == 'J');
 			if ((j_n = atoi(optarg)) <= 0) {
 				fprintf(stderr, "-%c needs an argument > 0\n", opt);
+				exit(EXIT_FAILURE);
+			}
+			break;
+		case 's':
+			if ((ceq = atoi(optarg)) < 0) {
+				fprintf(stderr, "-%c needs an argument >= 0\n", opt);
 				exit(EXIT_FAILURE);
 			}
 			break;
@@ -1699,35 +2138,45 @@ int main(int argc, char **argv)
 		break;
 	}
 
-	/* TODO? move this block to instance_run */
-	static char buf[128];
-	snprintf(buf, sizeof(buf),
-		"mode: %c, rate: %u, cap: %u, rounds: %u, "
-		"I.n: %d (var: %d), J.n: %d (var: %d)",
-		attack_mode, rate, cap, rounds, i_n, I.vlen, j_n, J.vlen);
-	ret = o.init(&o, buf);
-	if (ret) {
-		fprintf(stderr, "error %d initializing output, aborting\n",
-			ret);
-		goto done;
-	}
-
 	switch (attack_mode) {
 	case ATTACK_PREIMAGE:
 		I.I = bits(&in, i_n);
 		O   = bits(&in, 80);
-		ret = keccak_preimage(&in, &I, O, &o);
+		op  = keccak_preimage(&in, &I, O, &o);
 		break;
 	case ATTACK_COLLISION:
 		I.I = bits(&in, i_n);
 		J.I = bits(&in, j_n);
-		ret = keccak_collision(&in, &I, &J, ceq, &o);
+		op  = keccak_collision(&in, &I, &J, ceq, &o);
 		break;
 	}
+	if (execute) {
+		fprintf(stderr, "total bits: %u\n", in.total_bits);
+		bb_t mem[div_ceil(in.total_bits,bb_t_bits)];
+		// memset(mem, 0, sizeof(mem));
+		ret = exec(mem, op);
+	} else {
+		/* TODO? move this block to instance_run */
+		static char buf[128];
+		snprintf(buf, sizeof(buf),
+			"mode: %c, rate: %u, cap: %u, rounds: %u, "
+			"I.n: %d (var: %d), J.n: %d (var: %d)",
+			attack_mode, rate, cap, rounds, i_n, I.vlen, j_n, J.vlen);
+		ret = o.init(&o, buf);
+		if (ret) {
+			fprintf(stderr, "error %d initializing output, aborting\n",
+				ret);
+			goto done;
+		}
+
+		ret = instance_run(&in, op, &o);
+	}
+	op_list_free_deep(op);
 	if (ret)
 		goto done;
 
-	print_stats(stderr);
+	if (!execute)
+		print_stats(stderr);
 
 	/* mode of operation: CNF generation vs. solution compilation */
 	if (!sol) {
@@ -1735,7 +2184,11 @@ int main(int argc, char **argv)
 		fprintf(o.f, "c rate: %u, cap: %u, rounds: %u, I.n: %u, J.n: %u\n",
 			rate, cap, rounds, I.n, J.n);
 		dimacs_cnf_print(o.f, &cnf);*/
-		o.fini(&o);
+		if (execute) {
+			/* TODO: output */
+		} else {
+			o.fini(&o);
+		}
 	} else {
 		/* assuming minisat, which unfortunately got an output format
 		 * that differs from DIMACS */
