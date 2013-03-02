@@ -1298,6 +1298,9 @@ static struct operation * op_add(const struct instance *in, unsigned n, unsigned
 #define OPS(...)		(struct operation[]){ __VA_ARGS__ }
 #define OP_LIST(arr,tail)	op_arr2list(ARRAY_SIZE((arr)),(arr),(tail))
 
+/* func(void) returning void (*)(void) */
+static void (*bla(void))(void) { return bla()(), bla(); }
+
 static struct operation * md5_chunk(
 	struct instance *in,
 	/* each n=32 */
@@ -1422,7 +1425,7 @@ static struct operation * md5_init(
 	struct md5 *alg, struct instance *in,
 	struct input *I
 ) {
-static const uint32_t k[] = {
+static const _Alignas(bb_t) uint32_t k[] = {
 	0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
 	0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
 	0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
@@ -1496,7 +1499,7 @@ static void md5(void)
 	struct bits O[4];
 
 	memset(&md5, 0, sizeof(md5));
-	I.I = bits(&in, 40);
+	I.I = bits(&in, 440);
 
 	o.init       = cnf_init;
 	o.bit_out    = cnf_bit_out;
@@ -1525,7 +1528,7 @@ static const uint32_t preimage[] = { /* data\n */
 		op_app(&OP_EXPECT(md5.H[i],O[i]), &tail);
 	}
 
-#if 1
+#if 0
 	fprintf(stderr, "total bits: %u\n", in.total_bits);
 	bb_t mem[div_ceil(in.total_bits,bb_t_bits)];
 	int ret = exec(mem, g);
@@ -1580,7 +1583,7 @@ static struct operation * keccak_f(
 	const struct keccak *kc,
 	const struct operation *call_round
 ) {
-	static const uint64_t keccak_RC[24] = {
+	static const _Alignas(bb_t) uint64_t keccak_RC[24] = {
 		[ 0] = 0x0000000000000001,
 		[ 1] = 0x0000000000008082,
 		[ 2] = 0x800000000000808A,
@@ -2032,7 +2035,7 @@ static void print_stats(FILE *f)
 		}
 }
 
-int main(int argc, char **argv)
+int _main(int argc, char **argv)
 {
 #if 1
 	md5();
@@ -2071,7 +2074,7 @@ int main(int argc, char **argv)
  * produced 12740 var, 25368 cl; minimized by minisat to 3540 var, 18744 cl,
  * now: 22692 var, 46264 cl; minimized: 7054 var, 36768 cl
  * -> meaning of ceq changed: not kc?.S EXPECT'ed but output of keccak */
-int _main(int argc, char **argv)
+int main(int argc, char **argv)
 {
 	struct instance in = INSTANCE_INIT;
 	struct cnf cnf = CNF_INIT;
